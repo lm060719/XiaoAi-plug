@@ -89,6 +89,7 @@ class ConfigRepository private constructor(context: Context) {
      * 拦截开关显示成关闭的,用户以为自己没开。
      */
     private fun defaultConfig() = AiConfig(
+        provider = "",
         endpoint = "",
         apiKey = "",
         model = "",

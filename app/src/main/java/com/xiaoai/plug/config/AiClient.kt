@@ -10,7 +10,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * OpenAI 兼容 chat/completions 客户端 + 工具执行循环。
+ * AI 客户端 + 工具执行循环。支持 OpenAI 兼容(含 xAI、硅基流动)和 Anthropic 两种报文。
+ *
+ * 内部一律用 OpenAI 的消息形状,Anthropic 的差异全压在 [postAnthropic] 里翻译 ——
+ * 下面这套工具循环因此不用关心当前接的是谁。
  *
  * 两种工具调用方式都支持:
  *  - **原生 function calling**(首选):请求带 `tools` 数组,响应里读 `message.tool_calls`。
@@ -24,6 +27,10 @@ object AiClient {
 
     private const val TAG = "XiaoAiProbe"
     private const val MAX_TOOL_ITERATIONS = 6
+
+    private const val ANTHROPIC_VERSION = "2023-06-01"
+    // Anthropic 必填。语音助手的答案都很短,4096 够用还留了工具循环的余量。
+    private const val ANTHROPIC_MAX_TOKENS = 4096
 
     // 一轮里模型可能要求调好几个工具。串行跑的话 3 个工具 × 各自 shell 开销就是好几秒,
     // 而它们之间没有依赖关系 —— 并行跑,一轮的耗时就是最慢那个工具的耗时。
@@ -71,7 +78,7 @@ object AiClient {
         val started = System.currentTimeMillis()
         return try {
             val answer = chatInternal(config, userText, ctx, allowMutating)
-            LogClient.chat(ctx, userText, answer, config.model, System.currentTimeMillis() - started)
+            LogClient.chat(ctx, userText, answer, config.effectiveModel, System.currentTimeMillis() - started)
             answer
         } catch (t: Throwable) {
             LogClient.error(
@@ -221,7 +228,7 @@ object AiClient {
     }
 
     /**
-     * 发一次 chat/completions,返回 assistant 那条 message(含可能的 tool_calls)。
+     * 发一次请求,返回 assistant 那条 message(含可能的 tool_calls)。
      * 带 tools 时若端点回 400,认为它不支持原生 function calling,降级重来一次。
      */
     private fun callModel(
@@ -230,15 +237,8 @@ object AiClient {
         specs: List<Tools.Spec>,
         ctx: Context?
     ): JSONObject {
-        val body = JSONObject()
-            .put("model", config.model)
-            .put("messages", messages)
-        if (specs.isNotEmpty()) {
-            body.put("tools", Tools.toOpenAiSchema(specs))
-            body.put("tool_choice", "auto")
-        }
         return try {
-            post(config, body)
+            request(config, messages, specs)
         } catch (t: HttpError) {
             if (specs.isNotEmpty() && t.code == 400) {
                 Log.w(TAG, "endpoint rejected native tools (400), falling back to text convention: ${t.body.take(200)}")
@@ -251,23 +251,177 @@ object AiClient {
                 // 这一轮先按无工具重发;下一轮 chat() 会走文本约定并把工具表写进 prompt。
                 // 注意本轮模型看不到工具表,可能直接给个"我不知道"——可以接受,
                 // 因为降级只会发生一次,之后整个进程都走文本路。
-                post(config, JSONObject().put("model", config.model).put("messages", messages))
+                request(config, messages, emptyList())
             } else throw t
         }
     }
 
+    /**
+     * 按服务商选报文格式。
+     *
+     * 不管走哪条路,**进出这个函数的都是 OpenAI 形状**:入参 `messages` 是 OpenAI 的
+     * 消息数组,返回值是 OpenAI 的 assistant message。Anthropic 那条路在函数内部
+     * 完成来回翻译,这样上面的工具循环一份代码通吃两种协议。
+     */
+    private fun request(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>
+    ): JSONObject = when (config.aiProvider.wire) {
+        AiProvider.Wire.OPENAI -> postOpenAi(config, messages, specs)
+        AiProvider.Wire.ANTHROPIC -> postAnthropic(config, messages, specs)
+    }
+
     private class HttpError(val code: Int, val body: String) : RuntimeException("HTTP $code: $body")
 
-    private fun post(config: AiConfig, body: JSONObject): JSONObject {
-        val base = config.endpoint.trimEnd('/')
+    private fun postOpenAi(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>
+    ): JSONObject {
+        val body = JSONObject()
+            .put("model", config.effectiveModel)
+            .put("messages", messages)
+        if (specs.isNotEmpty()) {
+            body.put("tools", Tools.toOpenAiSchema(specs))
+            body.put("tool_choice", "auto")
+        }
+        val base = config.effectiveEndpoint.trimEnd('/')
         val url = URL(if (base.endsWith("/chat/completions")) base else "$base/chat/completions")
+        val headers = HashMap<String, String>()
+        if (config.apiKey.isNotBlank()) headers["Authorization"] = "Bearer ${config.apiKey}"
+        return postJson(url, headers, body)
+            .getJSONArray("choices")
+            .getJSONObject(0)
+            .getJSONObject("message")
+    }
+
+    /**
+     * Anthropic Messages API。和 OpenAI 有三处对不上,都在这儿抹平:
+     *  1. system 不在 messages 里,是顶层字段
+     *  2. 工具结果不是 role=tool,是塞进 user 消息的 tool_result 块 ——
+     *     而且同一轮的多个结果必须**并在同一条** user 消息里,分开发会被判为漏答
+     *  3. max_tokens 必填
+     *
+     * 没开 thinking:这是语音助手,工具循环本来就能跑到几十秒,再加思考链只会更慢。
+     */
+    private fun postAnthropic(
+        config: AiConfig,
+        messages: JSONArray,
+        specs: List<Tools.Spec>
+    ): JSONObject {
+        val system = StringBuilder()
+        val converted = JSONArray()
+        for (i in 0 until messages.length()) {
+            val m = messages.optJSONObject(i) ?: continue
+            when (m.optString("role")) {
+                "system" -> {
+                    if (system.isNotEmpty()) system.append("\n\n")
+                    system.append(m.optString("content"))
+                }
+                "tool" -> {
+                    val block = JSONObject()
+                        .put("type", "tool_result")
+                        .put("tool_use_id", m.optString("tool_call_id", m.optString("name")))
+                        .put("content", m.optString("content"))
+                    // 紧邻的上一条已经是"装工具结果的 user 消息"就并进去,否则新开一条
+                    val last = converted.optJSONObject(converted.length() - 1)
+                    if (last != null && last.optString("role") == "user" && last.opt("content") is JSONArray) {
+                        last.getJSONArray("content").put(block)
+                    } else {
+                        converted.put(
+                            JSONObject().put("role", "user").put("content", JSONArray().put(block))
+                        )
+                    }
+                }
+                "assistant" -> converted.put(assistantToAnthropic(m))
+                else -> converted.put(
+                    JSONObject().put("role", "user").put("content", m.optString("content"))
+                )
+            }
+        }
+
+        val body = JSONObject()
+            .put("model", config.effectiveModel)
+            .put("max_tokens", ANTHROPIC_MAX_TOKENS)
+            .put("messages", converted)
+        if (system.isNotEmpty()) body.put("system", system.toString())
+        if (specs.isNotEmpty()) {
+            body.put("tools", Tools.toAnthropicSchema(specs))
+            body.put("tool_choice", JSONObject().put("type", "auto"))
+        }
+
+        val base = config.effectiveEndpoint.trimEnd('/')
+        val url = URL(if (base.endsWith("/messages")) base else "$base/messages")
+        val headers = HashMap<String, String>()
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+        if (config.apiKey.isNotBlank()) headers["x-api-key"] = config.apiKey
+        return anthropicToOpenAi(postJson(url, headers, body))
+    }
+
+    /** OpenAI 的 assistant message → Anthropic 的 assistant 消息(tool_calls 变 tool_use 块)。 */
+    private fun assistantToAnthropic(m: JSONObject): JSONObject {
+        val calls = m.optJSONArray("tool_calls")
+        val text = m.optString("content", "")
+        if (calls == null || calls.length() == 0) {
+            return JSONObject().put("role", "assistant").put("content", text)
+        }
+        val blocks = JSONArray()
+        if (text.isNotBlank()) blocks.put(JSONObject().put("type", "text").put("text", text))
+        for (i in 0 until calls.length()) {
+            val c = calls.optJSONObject(i) ?: continue
+            val fn = c.optJSONObject("function") ?: continue
+            // arguments 按 OpenAI 规范是字符串化的 JSON,Anthropic 的 input 要的是对象
+            val args = when (val a = fn.opt("arguments")) {
+                is JSONObject -> a
+                is String -> try { JSONObject(a) } catch (t: Throwable) { JSONObject() }
+                else -> JSONObject()
+            }
+            blocks.put(
+                JSONObject()
+                    .put("type", "tool_use")
+                    .put("id", c.optString("id", "call_$i"))
+                    .put("name", fn.optString("name"))
+                    .put("input", args)
+            )
+        }
+        return JSONObject().put("role", "assistant").put("content", blocks)
+    }
+
+    /** Anthropic 响应 → OpenAI 形状的 assistant message,好让上面的循环原样处理。 */
+    private fun anthropicToOpenAi(resp: JSONObject): JSONObject {
+        val content = resp.optJSONArray("content") ?: JSONArray()
+        val text = StringBuilder()
+        val calls = JSONArray()
+        for (i in 0 until content.length()) {
+            val b = content.optJSONObject(i) ?: continue
+            when (b.optString("type")) {
+                "text" -> text.append(b.optString("text"))
+                "tool_use" -> calls.put(
+                    JSONObject()
+                        .put("id", b.optString("id", "call_$i"))
+                        .put("type", "function")
+                        .put(
+                            "function",
+                            JSONObject()
+                                .put("name", b.optString("name"))
+                                // extractCalls 认对象也认字符串,这里直接给对象
+                                .put("arguments", b.optJSONObject("input") ?: JSONObject())
+                        )
+                )
+            }
+        }
+        val out = JSONObject().put("role", "assistant").put("content", text.toString())
+        if (calls.length() > 0) out.put("tool_calls", calls)
+        return out
+    }
+
+    private fun postJson(url: URL, headers: Map<String, String>, body: JSONObject): JSONObject {
         val conn = url.openConnection() as HttpURLConnection
         try {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
-            if (config.apiKey.isNotBlank()) {
-                conn.setRequestProperty("Authorization", "Bearer ${config.apiKey}")
-            }
+            for ((k, v) in headers) conn.setRequestProperty(k, v)
             conn.doOutput = true
             conn.connectTimeout = 30000
             conn.readTimeout = 60000
@@ -279,9 +433,6 @@ object AiClient {
             val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
             if (code !in 200..299) throw HttpError(code, text)
             return JSONObject(text)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
         } finally {
             conn.disconnect()
         }

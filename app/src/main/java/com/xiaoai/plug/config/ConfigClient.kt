@@ -5,6 +5,8 @@ import android.net.Uri
 import android.os.Bundle
 
 data class AiConfig(
+    // 服务商 key(见 AiProvider.key)。空串 = 旧存档,按 OpenAI 兼容处理。
+    val provider: String,
     val endpoint: String,
     val apiKey: String,
     val model: String,
@@ -24,7 +26,27 @@ data class AiConfig(
     val enabledTools: String = "",
     // 原生 function calling(默认开,端点不支持会自动降级)
     val useNativeTools: Boolean = true
-)
+) {
+    /** 当前服务商。旧存档(provider 为空)落到 [AiProvider.DEFAULT]。 */
+    val aiProvider: AiProvider get() = AiProvider.fromKey(provider)
+
+    /**
+     * 实际发请求用的地址/模型:用户没填就用服务商的默认值。
+     *
+     * 调用方一律用这两个,别直接读 [endpoint] / [model] —— 那两个是**用户输入的原文**,
+     * 空串是合法状态(表示"用默认"),拿去发请求会得到一个空 URL。
+     */
+    val effectiveEndpoint: String get() = endpoint.ifBlank { aiProvider.defaultEndpoint }
+    val effectiveModel: String get() = model.ifBlank { aiProvider.defaultModel }
+
+    /**
+     * 配置是否齐全到能真发一次请求。
+     *
+     * 地址和模型都有默认值兜底了,所以唯一还可能缺的就是密钥 ——
+     * 各处"是否已配置"的判断都该问这个,而不是再去看 endpoint 空不空。
+     */
+    val isUsable: Boolean get() = apiKey.isNotBlank()
+}
 
 // 放行词默认值:只有说"打开/开启/进入/去..."才跳转
 const val DEFAULT_JUMP_ALLOW_WORDS = "打开,开启,进入,去,跳转,启动"
@@ -63,6 +85,7 @@ object ConfigClient {
         val speakRaw = result?.getString(ConfigKeys.SPEAK_ANSWER)
         val nativeToolsRaw = result?.getString(ConfigKeys.USE_NATIVE_TOOLS)
         return AiConfig(
+            provider = result?.getString(ConfigKeys.PROVIDER).orEmpty(),
             endpoint = result?.getString(ConfigKeys.ENDPOINT).orEmpty(),
             apiKey = result?.getString(ConfigKeys.API_KEY).orEmpty(),
             model = result?.getString(ConfigKeys.MODEL).orEmpty(),
@@ -81,6 +104,7 @@ object ConfigClient {
     /** @return 写入是否成功。旧代码忽略了这个返回值,界面上「已保存」的提示因此可能是假的。 */
     fun write(context: Context, config: AiConfig): Boolean {
         val extras = Bundle().apply {
+            putString(ConfigKeys.PROVIDER, config.provider)
             putString(ConfigKeys.ENDPOINT, config.endpoint)
             putString(ConfigKeys.API_KEY, config.apiKey)
             putString(ConfigKeys.MODEL, config.model)

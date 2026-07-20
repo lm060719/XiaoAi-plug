@@ -105,8 +105,8 @@ fun HomeScreen(
                     checked = config.enabled,
                     onCheckedChange = { on -> vm.update { it.copy(enabled = on) } },
                     title = "启用替换",
-                    summary = if (config.endpoint.isBlank()) "尚未填写 API 地址"
-                    else config.model.ifBlank { "未填模型名" }
+                    summary = if (!config.isUsable) "尚未填写 API Key"
+                    else "${config.aiProvider.label} · ${config.effectiveModel}"
                 )
                 SwitchPreference(
                     checked = config.speakAnswer,

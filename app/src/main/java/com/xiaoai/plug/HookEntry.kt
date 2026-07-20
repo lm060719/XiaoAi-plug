@@ -779,7 +779,7 @@ class HookEntry : IXposedHookLoadPackage {
         val cfg = lastConfig ?: return false
         if (!cfg.blockWebSearch) return false
         // 只有开了 AI 接管才拦 —— 否则拦掉又没人回答,用户就什么都得不到了
-        if (!cfg.enabled || cfg.endpoint.isBlank()) return false
+        if (!cfg.enabled || !cfg.isUsable) return false
         // 问话要足够新,和这次跳转属于同一次交互
         if (System.currentTimeMillis() - lastQueryTime > 12_000L) return false
         if (lastQueryText.isBlank()) return false
@@ -1231,7 +1231,7 @@ class HookEntry : IXposedHookLoadPackage {
                     if (config != null) lastConfig = config
 
                     // 以下是 AI 文本接管,需要功能启用
-                    if (config == null || !config.enabled || config.endpoint.isBlank()) {
+                    if (config == null || !config.enabled || !config.isUsable) {
                         return // 未启用 AI 接管,保持原生行为(但跳转拦截仍可生效)
                     }
                     // 是"查看类"候选 → 预标记,以便它的 FlowTemplateToastCard 一 bindView 就被我们占位撑开

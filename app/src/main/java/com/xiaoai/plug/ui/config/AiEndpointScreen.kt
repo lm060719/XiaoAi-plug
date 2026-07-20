@@ -15,6 +15,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.xiaoai.plug.config.AiProvider
 import com.xiaoai.plug.ui.ConfigViewModel
 import com.xiaoai.plug.ui.TestState
 import com.xiaoai.plug.ui.nav.CardContentPadding
@@ -28,6 +29,7 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Hide
 import top.yukonga.miuix.kmp.icon.extended.Show
+import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 @Composable
@@ -36,19 +38,47 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
     val testState by vm.testState.collectAsStateWithLifecycle()
     var keyVisible by remember { mutableStateOf(false) }
 
+    val provider = config.aiProvider
+    val providers = AiProvider.entries
+
     SubScreen(title = "AI 接入", bottomInset = bottomInset, onBack = onBack) {
+        item { SmallTitle("服务商") }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                WindowDropdownPreference(
+                    title = "接入方式",
+                    items = providers.map { it.label },
+                    selectedIndex = providers.indexOf(provider),
+                    // 只存 key，不动用户已填的地址/模型 —— 那两个留空就自动跟着新服务商的默认走，
+                    // 填过的则原样保留，切回来还在。
+                    onSelectedIndexChange = { i ->
+                        vm.update { it.copy(provider = providers[i].key) }
+                    }
+                )
+            }
+        }
+        item {
+            Text(
+                text = "xAI 和硅基流动都是 OpenAI 兼容协议，Anthropic 走自己的 /messages。",
+                fontSize = MiuixTheme.textStyles.footnote2.fontSize,
+                color = MiuixTheme.colorScheme.onBackgroundVariant,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+            )
+        }
+
         item { SmallTitle("端点") }
         item {
             Card(Modifier.fillMaxWidth(), insideMargin = CardContentPadding) {
                 TextField(
                     value = config.endpoint,
                     onValueChange = { v -> vm.update { it.copy(endpoint = v) } },
-                    label = "API 地址",
-                    useLabelAsPlaceholder = false,
+                    // 留空时这行灰字就是实际会用的地址，不是单纯的提示
+                    label = provider.defaultEndpoint,
+                    useLabelAsPlaceholder = true,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
                 )
                 Text(
-                    text = "OpenAI 兼容的 /chat/completions，可省略末尾路径。例：https://api.openai.com/v1",
+                    text = "API 地址，可省略末尾路径。留空即使用上方灰字的默认地址。",
                     fontSize = MiuixTheme.textStyles.footnote2.fontSize,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -77,9 +107,15 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                 TextField(
                     value = config.model,
                     onValueChange = { v -> vm.update { it.copy(model = v) } },
-                    label = "模型名",
-                    useLabelAsPlaceholder = false,
+                    label = provider.defaultModel,
+                    useLabelAsPlaceholder = true,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+                )
+                Text(
+                    text = "模型名。留空即使用上方灰字的默认模型。",
+                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(bottom = 4.dp)
                 )
             }
         }

@@ -80,30 +80,48 @@ object Tools {
         return ALL.filter { it.name in want }
     }
 
+    /** 单个工具的 JSON Schema。OpenAI 叫 `parameters`,Anthropic 叫 `input_schema`,内容一样。 */
+    private fun paramsSchema(s: Spec): JSONObject {
+        val props = JSONObject()
+        val required = JSONArray()
+        for (p in s.params) {
+            val po = JSONObject().put("type", p.type).put("description", p.description)
+            p.enum?.let { po.put("enum", JSONArray(it)) }
+            props.put(p.name, po)
+            if (p.required) required.put(p.name)
+        }
+        return JSONObject()
+            .put("type", "object")
+            .put("properties", props)
+            .put("required", required)
+    }
+
     /** OpenAI `tools` 数组。原生 function calling 走这个,比文本约定可靠得多。 */
     fun toOpenAiSchema(specs: List<Spec>): JSONArray {
         val arr = JSONArray()
         for (s in specs) {
-            val props = JSONObject()
-            val required = JSONArray()
-            for (p in s.params) {
-                val po = JSONObject().put("type", p.type).put("description", p.description)
-                p.enum?.let { po.put("enum", JSONArray(it)) }
-                props.put(p.name, po)
-                if (p.required) required.put(p.name)
-            }
-            val params = JSONObject()
-                .put("type", "object")
-                .put("properties", props)
-                .put("required", required)
             arr.put(
                 JSONObject().put("type", "function").put(
                     "function",
                     JSONObject()
                         .put("name", s.name)
                         .put("description", s.description)
-                        .put("parameters", params)
+                        .put("parameters", paramsSchema(s))
                 )
+            )
+        }
+        return arr
+    }
+
+    /** Anthropic `tools` 数组。比 OpenAI 少一层包装:名字和 schema 直接摊在顶层。 */
+    fun toAnthropicSchema(specs: List<Spec>): JSONArray {
+        val arr = JSONArray()
+        for (s in specs) {
+            arr.put(
+                JSONObject()
+                    .put("name", s.name)
+                    .put("description", s.description)
+                    .put("input_schema", paramsSchema(s))
             )
         }
         return arr

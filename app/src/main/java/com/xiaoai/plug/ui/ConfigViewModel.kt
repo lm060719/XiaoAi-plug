@@ -88,8 +88,8 @@ class ConfigViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _testState.value = TestState.Running
             val cfg = config.value
-            if (cfg.endpoint.isBlank()) {
-                _testState.value = TestState.Failed("请先填写 API 地址")
+            if (!cfg.isUsable) {
+                _testState.value = TestState.Failed("请先填写 API Key")
                 return@launch
             }
             val result = withContext(Dispatchers.IO) {

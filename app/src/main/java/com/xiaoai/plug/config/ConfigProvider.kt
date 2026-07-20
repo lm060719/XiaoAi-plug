@@ -10,6 +10,8 @@ import android.os.Bundle
 import com.xiaoai.plug.auto.UiAutoService
 
 object ConfigKeys {
+    // 服务商:openai / anthropic / xai / siliconflow(见 AiProvider)
+    const val PROVIDER = "provider"
     const val ENDPOINT = "endpoint"
     const val API_KEY = "api_key"
     const val MODEL = "model"
@@ -33,7 +35,7 @@ object ConfigKeys {
     const val USE_NATIVE_TOOLS = "use_native_tools"
 
     val ALL = listOf(
-        ENDPOINT, API_KEY, MODEL, SYSTEM_PROMPT, ENABLED,
+        PROVIDER, ENDPOINT, API_KEY, MODEL, SYSTEM_PROMPT, ENABLED,
         BLOCK_VIEW_JUMP, JUMP_ALLOW_WORDS,
         BLOCK_WEB_SEARCH, WEB_SEARCH_ALLOW_WORDS,
         SPEAK_ANSWER,

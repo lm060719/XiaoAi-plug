@@ -78,11 +78,8 @@ private fun ConfigList(
             Card(Modifier.fillMaxWidth()) {
                 ArrowPreference(
                     title = "AI 接入",
-                    summary = when {
-                        config.endpoint.isBlank() -> "未配置"
-                        config.model.isBlank() -> "未填模型名"
-                        else -> config.model
-                    },
+                    summary = if (!config.isUsable) "未配置"
+                    else "${config.aiProvider.label} · ${config.effectiveModel}",
                     onClick = { onOpen(ConfigRoute.AI) }
                 )
                 ArrowPreference(
