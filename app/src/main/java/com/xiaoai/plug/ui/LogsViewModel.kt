@@ -61,6 +61,20 @@ class LogsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 删掉单条。
+     *
+     * 先把内存里的列表摘掉再落库:列表的移除动画要立刻跟手,等 IO 回来才更新会顿一下。
+     * 删完**故意不 refresh** —— 重查会整个换掉 _entries,正在播的移除动画会被拦腰打断。
+     * 少一条不影响筛选和搜索的结果集,下次 refresh 自然对齐。
+     */
+    fun delete(id: Long) {
+        _entries.value = _entries.value.filterNot { it.id == id }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { store.delete(id) }
+        }
+    }
+
     fun clear() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { store.clear() }

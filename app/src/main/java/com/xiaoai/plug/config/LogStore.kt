@@ -160,6 +160,11 @@ class LogStore private constructor(context: Context) :
             arrayOf(sinceMillis.toString())
         ).use { c -> if (c.moveToNext()) c.getInt(0) else 0 }
 
+    /** 删掉单条(记录页左滑删除)。id 是主键，走索引,不用管表里有多少条。 */
+    fun delete(id: Long) {
+        writableDatabase.delete(TABLE, "id = ?", arrayOf(id.toString()))
+    }
+
     fun clear() {
         writableDatabase.delete(TABLE, null, null)
     }
