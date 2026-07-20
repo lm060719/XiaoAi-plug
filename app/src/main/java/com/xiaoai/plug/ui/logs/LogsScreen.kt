@@ -92,7 +92,7 @@ fun LogsScreen(bottomInset: Dp, vm: LogsViewModel = viewModel()) {
         if (entries.isEmpty()) {
             item {
                 Text(
-                    text = "还没有记录。强退并重开小爱助手，说一句会触发接管的话就会出现在这里。",
+                    text = "还没有记录。强退并重开超级小爱，说一句会触发接管的话就会出现在这里。",
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                     fontSize = MiuixTheme.textStyles.footnote1.fontSize,
                     modifier = Modifier.padding(16.dp)

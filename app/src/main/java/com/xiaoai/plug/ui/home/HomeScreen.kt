@@ -51,13 +51,13 @@ fun HomeScreen(
                 StatusRow(
                     ok = status.moduleActive,
                     title = "LSPosed 模块",
-                    summary = if (status.moduleActive) "已激活，作用于小爱助手"
-                    else "未激活。作用域需同时勾上「小爱助手」和本应用"
+                    summary = if (status.moduleActive) "已激活"
+                    else "未激活。作用域需勾上「超级小爱」"
                 )
                 StatusRow(
                     ok = status.accessibilityOn,
                     title = "无障碍服务",
-                    summary = if (status.accessibilityOn) "已开启，可代发微信消息"
+                    summary = if (status.accessibilityOn) "已开启"
                     else "未开启。send_message 工具需要它",
                     action = if (status.accessibilityOn) null else ({
                         runCatching {
@@ -112,7 +112,7 @@ fun HomeScreen(
                     checked = config.speakAnswer,
                     onCheckedChange = { on -> vm.update { it.copy(speakAnswer = on) } },
                     title = "语音播报",
-                    summary = "用小爱自己的声音念出答案"
+                    summary = "TTS替换，关闭即输出时静音"
                 )
                 SwitchPreference(
                     checked = config.blockViewJump,
@@ -131,7 +131,7 @@ fun HomeScreen(
 
         item {
             Text(
-                text = "改完配置需要强退并重新打开小爱助手才会生效。",
+                text = "修改后结束运行超级小爱生效。",
                 fontSize = MiuixTheme.textStyles.footnote1.fontSize,
                 color = MiuixTheme.colorScheme.onBackgroundVariant,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 16.dp)

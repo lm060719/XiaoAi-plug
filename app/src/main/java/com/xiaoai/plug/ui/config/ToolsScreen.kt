@@ -123,7 +123,7 @@ fun ToolsScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                     // 这一组单独拎出来是有来历的：曾经出过「我们没接管、模型却照跑」
                     // 把微信真打开了的事故，动作类工具的风险跟只读工具完全不是一回事。
                     text = "这些工具会启动应用、改设置、动音量。只有在本轮确实由本模块接管时才会执行。" +
-                        "带 root 的还需要在 KernelSU 里给小爱助手授权。",
+                        "带 root 的还需要在 KernelSU 里给超级小爱授权。",
                     fontSize = MiuixTheme.textStyles.footnote2.fontSize,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)

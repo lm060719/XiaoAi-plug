@@ -100,7 +100,7 @@ fun SettingsScreen(bottomInset: Dp) {
                     modifier = Modifier.padding(top = 4.dp)
                 )
                 Text(
-                    text = "改完配置需要强退并重新打开小爱助手才会生效。\n" +
+                    text = "改完配置需要强退并重新打开超级小爱才会生效。\n" +
                         "探针日志：adb logcat -s XiaoAiProbe",
                     fontSize = MiuixTheme.textStyles.footnote2.fontSize,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,

@@ -43,7 +43,7 @@ object ConfigKeys {
 
 /**
  * 跨进程配置存取：MainActivity(本模块自己的进程)写配置，
- * Hook 注入到小爱助手进程后通过 ContentResolver.call() 读配置。
+ * Hook 注入到超级小爱进程后通过 ContentResolver.call() 读配置。
  */
 class ConfigProvider : ContentProvider() {
 
@@ -74,7 +74,7 @@ class ConfigProvider : ContentProvider() {
         /**
          * 允许调用本 provider 的包名。
          *
-         * 这个 provider 必须 exported —— hook 跑在小爱助手进程里,不导出就过不了桥。
+         * 这个 provider 必须 exported —— hook 跑在超级小爱进程里,不导出就过不了桥。
          * 但它存着 **API Key**,现在还存着对话记录,不设防的话设备上任意一个 App 一条
          *   adb shell content call --uri content://com.xiaoai.plug.config --method get
          * 就能全读走。callingPackage 由 Binder 在系统侧填,调用方伪造不了,拿来做白名单足够。
