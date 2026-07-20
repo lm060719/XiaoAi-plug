@@ -57,15 +57,6 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                 )
             }
         }
-        item {
-            Text(
-                text = "xAI 和硅基流动都是 OpenAI 兼容协议，Anthropic 走自己的 /messages。",
-                fontSize = MiuixTheme.textStyles.footnote2.fontSize,
-                color = MiuixTheme.colorScheme.onBackgroundVariant,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-            )
-        }
-
         item { SmallTitle("端点") }
         item {
             Card(Modifier.fillMaxWidth(), insideMargin = CardContentPadding) {
@@ -77,13 +68,6 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                     useLabelAsPlaceholder = true,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
                 )
-                Text(
-                    text = "API 地址，可省略末尾路径。留空即使用上方灰字的默认地址。",
-                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-
                 TextField(
                     value = config.apiKey,
                     onValueChange = { v -> vm.update { it.copy(apiKey = v) } },
@@ -110,12 +94,6 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                     label = provider.defaultModel,
                     useLabelAsPlaceholder = true,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
-                )
-                Text(
-                    text = "模型名。留空即使用上方灰字的默认模型。",
-                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                    modifier = Modifier.padding(bottom = 4.dp)
                 )
             }
         }
@@ -147,7 +125,7 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                         modifier = Modifier.fillMaxWidth()
                     )
                     val (msg, color) = when (val s = testState) {
-                        is TestState.Ok -> "通了，模型回复：${s.reply}" to Color(0xFF34C759)
+                        is TestState.Ok -> "测试OK：${s.reply}" to Color(0xFF34C759)
                         is TestState.Failed -> "失败：${s.message}" to Color(0xFFFF3B30)
                         else -> null to Color.Unspecified
                     }
@@ -159,12 +137,6 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                             modifier = Modifier.padding(vertical = 8.dp)
                         )
                     }
-                    Text(
-                        text = "测试时会临时关掉全部工具，只验证地址、密钥和模型名，不会真去动设备。",
-                        fontSize = MiuixTheme.textStyles.footnote2.fontSize,
-                        color = MiuixTheme.colorScheme.onBackgroundVariant,
-                        modifier = Modifier.padding(bottom = 4.dp)
-                    )
                 }
             }
         }
