@@ -1,0 +1,101 @@
+name: Sync to Xposed-Modules-Repo
+
+on:
+  push:
+    branches: [ master ]
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-commits:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Force push master to target repo
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git remote add target "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git"
+          git push target master --force
+
+  sync-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push master and tags to target repo
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          git remote add target "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git"
+          git push target master --force
+          git push target --tags --force
+
+      - name: Sync release to target repo
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          NAME="${{ github.event.release.name }}"
+          PRERELEASE="${{ github.event.release.prerelease }}"
+
+          # Use Python to safely handle JSON with special characters
+          python3 - "$TAG" "$NAME" "$PRERELEASE" <<'PYEOF'
+          import sys, json, urllib.request, os
+
+          tag = sys.argv[1]
+          name = sys.argv[2]
+          prerelease = sys.argv[3].lower() == "true"
+          token = os.environ["SYNC_TOKEN"]
+          repo = "Xposed-Modules-Repo/io.mo.xiaoaiplug"
+
+          # Get release body from the source release
+          src_release_url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{tag}"
+          req = urllib.request.Request(src_release_url, headers={"Authorization": f"token {token}"})
+          try:
+              src = json.loads(urllib.request.urlopen(req).read())
+              body = src.get("body", "")
+          except Exception:
+              body = ""
+
+          # Delete existing release on target if present
+          try:
+              target_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+              req2 = urllib.request.Request(target_url, headers={"Authorization": f"token {token}"})
+              existing = json.loads(urllib.request.urlopen(req2).read())
+              del_url = f"https://api.github.com/repos/{repo}/releases/{existing['id']}"
+              req3 = urllib.request.Request(del_url, data=b"", headers={"Authorization": f"token {token}"}, method="DELETE")
+              urllib.request.urlopen(req3)
+              print(f"Deleted existing release for {tag}")
+          except Exception:
+              pass
+
+          # Create new release on target
+          payload = json.dumps({
+              "tag_name": tag,
+              "name": name,
+              "body": body,
+              "prerelease": prerelease
+          }).encode()
+
+          create_url = f"https://api.github.com/repos/{repo}/releases"
+          req4 = urllib.request.Request(create_url, data=payload, headers={
+              "Authorization": f"token {token}",
+              "Content-Type": "application/json"
+          })
+          resp = json.loads(urllib.request.urlopen(req4).read())
+          print(f"Created release: {resp.get('html_url', 'unknown')}")
+          print(f"Upload URL: {resp.get('upload_url', 'none')}")
+PYEOF
