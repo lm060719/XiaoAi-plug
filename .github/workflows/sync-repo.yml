@@ -18,12 +18,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Force push master to target repo
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          GIT_ASKPASS=echo GIT_TERMINAL_PROMPT=0 git -c credential.helper= push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" master --force
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" master --force
 
   sync-release:
     if: github.event_name == 'release'
@@ -33,13 +34,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Push master and tags to target repo
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          GIT_ASKPASS=echo GIT_TERMINAL_PROMPT=0 git -c credential.helper= push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" master --force
-          GIT_ASKPASS=echo GIT_TERMINAL_PROMPT=0 git -c credential.helper= push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" --tags --force
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" master --force
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git" --tags --force
 
       - name: Sync release to target repo
         env:
