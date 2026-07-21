@@ -47,6 +47,8 @@
 | `top_storage_apps` | 各应用存储占用排行 |
 | `list_apps` | 已安装应用（包名 + 显示名） |
 | `recent_notifications` | 最近的通知 |
+| `get_location` | 设备当前位置（经纬度 + 地名），走系统定位而非 IP |
+| `weather` | 天气实况与预报（wttr.in），默认查当前位置 |
 | `get_setting` | 读系统设置项（System / Secure / Global） |
 | `read_file` | 读任意文本文件（root） |
 | `current_time` | 当前系统时间 |

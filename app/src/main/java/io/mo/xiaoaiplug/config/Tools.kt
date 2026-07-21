@@ -1,14 +1,22 @@
 package io.mo.xiaoaiplug.config
 
 import android.content.Context
+import android.location.Address
+import android.location.Geocoder
+import android.location.Location
+import android.location.LocationManager
+import android.os.CancellationSignal
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 工具注册表。
@@ -69,7 +77,7 @@ object Tools {
             listApps, launchApp, sendMessage, readFile,
             getSetting, setSetting,
             mediaControl, setVolume,
-            currentTime, recentNotifications,
+            currentTime, recentNotifications, getLocation, weather,
             saveMemory
         )
     }
@@ -1002,6 +1010,293 @@ object Tools {
             sh("dumpsys notification --noredact | grep -E 'pkg=|android.title=|android.text=' | head -n 60")
         }
     )
+
+    // ---------------------------------------------------------------- 定位
+
+    /**
+     * "我在哪"、以及所有需要"这里"的问题(天气、附近、路况)。
+     *
+     * 真机事故:没这个工具时模型只能拿 run_shell 去 curl IP 定位服务,
+     * 而这台机器挂着代理(clash),出口 IP 在美国 —— "看看现在天气"被定位到
+     * **Santa Clara, California**,然后一路 find /data 翻天气应用的缓存,
+     * 六轮烧光回"工具调用超过上限"。IP 定位在有代理/VPN 时是**系统性错误**,
+     * 不是精度差一点的问题,再怎么换服务商都救不回来。
+     *
+     * 走系统定位就没这个问题:工具跑在被 hook 的 com.miui.voiceassist 进程里,
+     * 而语音助手本来就要查天气/导航,**它自己就持有 ACCESS_FINE_LOCATION**
+     * (实测 granted=true),所以这里直接问 LocationManager 就行,
+     * 不需要我们自己的应用去申请权限、也不用弹框。
+     *
+     * 默认只读 getLastKnownLocation:系统里一直有别的应用在定位,这份缓存通常是
+     * 分钟级的,而且**瞬时返回**(实测 dumpsys location 里就有 hAcc=30m 的网络定位)。
+     * 只有缓存太旧或压根没有时才去要一次新定位 —— 那要等 GPS/基站,可能好几秒。
+     */
+    private val getLocation = Spec(
+        name = "get_location",
+        description = "获取设备当前位置（经纬度，尽量附带地名）",
+        modelHint = "用户问天气、附近有什么、我在哪、路况时，先用这个拿位置。" +
+                "**不要**用 run_shell 去 curl IP 定位服务：本机可能挂代理，IP 会定到国外，" +
+                "拿到的城市是错的。返回的经纬度可以直接用来查天气" +
+                "（如 wttr.in 接受「纬度,经度」格式）。",
+        params = listOf(
+            Param("fresh", "boolean", "强制重新定位（要等几秒），默认 false，用系统缓存")
+        ),
+        handler = { args, ctx -> locate(ctx, args.optBoolean("fresh", false)) }
+    )
+
+    /** 缓存比这个还旧就去要一次新定位。 */
+    private const val LOCATION_FRESH_MS = 5 * 60 * 1000L
+
+    /** 等新定位的上限。超了就用手上的缓存,**宁可给个旧位置也别让这一轮空手而归** —— 空手回去模型就该去翻 IP 了。 */
+    private const val LOCATION_WAIT_SEC = 8L
+
+    /**
+     * 拿设备位置。[weather] 也用它 —— 天气工具默认查"这里",没有位置就只能回头
+     * 去猜 IP,那正是这个工具要根治的毛病。
+     */
+    private fun deviceLocation(ctx: Context, fresh: Boolean): Location? {
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+
+        // 各家 provider 的缓存互相独立,挨个问一遍取最新的那份。
+        // FUSED 通常最准(系统融合过),但不保证有,所以不能只问它。
+        var best: Location? = null
+        for (p in listOf(
+            LocationManager.FUSED_PROVIDER,
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+            LocationManager.PASSIVE_PROVIDER
+        )) {
+            val l = try {
+                lm.getLastKnownLocation(p)
+            } catch (t: Throwable) {
+                null      // 没权限或 provider 不存在,换下一个
+            } ?: continue
+            if (best == null || l.time > best.time) best = l
+        }
+
+        val stale = best == null || System.currentTimeMillis() - best.time > LOCATION_FRESH_MS
+        if (fresh || stale) currentLocation(lm, ctx)?.let { best = it }
+        return best
+    }
+
+    private fun locate(ctx: Context?, fresh: Boolean): String {
+        if (ctx == null) return "error: 没有 Context，取不到系统定位服务"
+        val loc = deviceLocation(ctx, fresh)
+            ?: return "error: 系统没有可用位置（定位服务可能关着，或宿主没有定位权限）"
+
+        val sb = StringBuilder()
+        placeName(ctx, loc)?.let { sb.append(it).append('\n') }
+        sb.append(String.format(Locale.US, "经纬度: %.6f, %.6f\n", loc.latitude, loc.longitude))
+        if (loc.hasAccuracy()) sb.append(String.format(Locale.US, "精度: ±%.0f 米\n", loc.accuracy))
+        // 新鲜度要如实说:模型据此决定"这个位置够不够用"、要不要 fresh=true 再来一次
+        val ageMin = (System.currentTimeMillis() - loc.time) / 60000
+        sb.append("来源: ").append(loc.provider ?: "未知")
+            .append("，").append(if (ageMin <= 0) "刚刚更新" else "${ageMin} 分钟前更新")
+        return sb.toString()
+    }
+
+    /**
+     * 要一次新定位。用 API 30+ 的 getCurrentLocation:它自带超时/取消,
+     * 比 requestLocationUpdates 再自己拆监听省事,而且**接受 Executor**,
+     * 不需要调用线程有 Looper —— 工具跑在线程池里,没有 Looper。
+     */
+    private fun currentLocation(lm: LocationManager, ctx: Context): Location? {
+        val provider = listOf(
+            LocationManager.FUSED_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+            LocationManager.GPS_PROVIDER
+        ).firstOrNull { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) }
+            ?: return null
+        return try {
+            val latch = CountDownLatch(1)
+            val holder = AtomicReference<Location?>(null)
+            val signal = CancellationSignal()
+            lm.getCurrentLocation(provider, signal, ctx.mainExecutor) { l ->
+                holder.set(l)
+                latch.countDown()
+            }
+            if (!latch.await(LOCATION_WAIT_SEC, TimeUnit.SECONDS)) {
+                signal.cancel()
+                Log.i(TAG, "getCurrentLocation timed out on $provider")
+            }
+            holder.get()
+        } catch (t: Throwable) {
+            Log.w(TAG, "getCurrentLocation failed: $t")
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------- 天气
+
+    /**
+     * 天气。数据来自 wttr.in（免费、不用 key）。
+     *
+     * 用 `format=j1` 的 JSON 而不是那个好看的单行格式:单行格式的**单位由服务端按
+     * 客户端 IP 猜**,而这台机器挂着代理,实测回的是 `+88°F ↑12mph` —— 华氏度和英里。
+     * j1 里 `temp_C`/`temp_F` 两套都给,单位由我们自己挑,代理再怎么绕都不影响。
+     *
+     * 不填 location 就用 [deviceLocation] 拿到的经纬度。这是这个工具存在的主要理由:
+     * 模型自己拼 curl 时会去问 IP 定位服务,而代理出口在美国,"看看现在天气"
+     * 一路答成加州的天气(真机事故,见 [getLocation] 上面那段)。
+     */
+    private val weather = Spec(
+        name = "weather",
+        description = "查询天气（当前实况 + 未来几天）",
+        modelHint = "用户问天气、要不要带伞、明天冷不冷时用，一次就够，不用再调别的工具。" +
+                "**不填 location 就是查用户当前所在地**（内部走系统定位，不是 IP 定位）；" +
+                "只有用户明确问别的城市时才填 location。",
+        params = listOf(
+            Param("location", "string", "地点，如「北京」「Shenzhen」或「纬度,经度」。留空 = 当前位置"),
+            Param("days", "integer", "要几天预报，1~3，默认 2（今天和明天）")
+        ),
+        handler = { args, ctx ->
+            weatherReport(
+                ctx,
+                args.optString("location", "").trim(),
+                args.optInt("days", 2).coerceIn(1, 3)
+            )
+        }
+    )
+
+    private const val WEATHER_TIMEOUT_SEC = 12
+
+    private fun weatherReport(ctx: Context?, location: String, days: Int): String {
+        val query: String
+        // wttr.in 的 nearest_area 给的是罗马字("Guangdong" "Sandong"),念出来不像人话。
+        // 走设备定位时顺手用系统 Geocoder 反查一个中文地名顶上去。
+        var displayName: String? = null
+        if (location.isNotBlank()) {
+            query = location
+        } else {
+            if (ctx == null) return "error: 没有 Context，取不到设备位置；可以让用户说个城市名再查。"
+            val loc = deviceLocation(ctx, false)
+                ?: return "error: 没填 location，又拿不到设备位置" +
+                        "（定位服务可能关着）。可以让用户说个城市名再查。"
+            displayName = placeName(ctx, loc)
+            // 给 wttr.in 经纬度而不是地名:免得地名歧义,也免得再绕一次地名解析
+            query = String.format(Locale.US, "%.4f,%.4f", loc.latitude, loc.longitude)
+        }
+        // 城市名可能是中文,必须百分号编码后再进 URL;整个 URL 再用单引号包给 shell
+        val url = "https://wttr.in/" + URLEncoder.encode(query, "UTF-8") +
+                "?format=j1&lang=zh-cn"
+        // 25KB 左右的 JSON,必须放大 limit —— 默认 6000 会在解析之前就把它截断
+        val raw = sh(
+            "curl -s --max-time $WEATHER_TIMEOUT_SEC ${shellQuote(url)}",
+            limit = 256 * 1024
+        )
+        val json = try {
+            JSONObject(raw)
+        } catch (t: Throwable) {
+            // wttr.in 查不到地名时回的是纯文本("Unknown location"),不是 JSON
+            return "error: 天气服务没返回可用数据: ${raw.take(200)}"
+        }
+
+        val sb = StringBuilder()
+        val area = json.optJSONArray("nearest_area")?.optJSONObject(0)
+        val fallbackPlace = listOfNotNull(area?.wttrValue("areaName"), area?.wttrValue("region"))
+            .distinct()
+            .joinToString("，")
+        sb.append(displayName ?: fallbackPlace.ifBlank { query }).append('\n')
+
+        json.optJSONArray("current_condition")?.optJSONObject(0)?.let { c ->
+            sb.append("现在 ").append(c.optString("temp_C")).append("°C")
+            val feels = c.optString("FeelsLikeC")
+            if (feels.isNotBlank() && feels != c.optString("temp_C")) {
+                sb.append("（体感 ").append(feels).append("°C）")
+            }
+            sb.append("，").append(c.desc())
+            sb.append("，湿度 ").append(c.optString("humidity")).append('%')
+            sb.append("，风 ").append(c.optString("windspeedKmph")).append("km/h")
+            sb.append('\n')
+        }
+
+        val list = json.optJSONArray("weather")
+        for (i in 0 until minOf(days, list?.length() ?: 0)) {
+            val d = list!!.optJSONObject(i) ?: continue
+            sb.append(
+                when (i) {
+                    0 -> "今天"
+                    1 -> "明天"
+                    else -> "后天"
+                }
+            ).append('(').append(d.optString("date")).append(") ")
+            sb.append(d.optString("mintempC")).append('~').append(d.optString("maxtempC")).append("°C")
+            // 白天的天气用中午那条(hourly 每 3 小时一条,下标 4 = 12:00),
+            // 比拿 hourly[0](凌晨 0 点)有代表性得多
+            val hourly = d.optJSONArray("hourly")
+            hourly?.optJSONObject(4)?.let { sb.append("，").append(it.desc()) }
+            // 降水概率取全天最大值:白天不下但夜里下,照样得提醒带伞
+            var maxRain = 0
+            for (h in 0 until (hourly?.length() ?: 0)) {
+                maxRain = maxOf(maxRain, hourly!!.optJSONObject(h)?.optString("chanceofrain")?.toIntOrNull() ?: 0)
+            }
+            if (maxRain > 0) sb.append("，降水概率 ").append(maxRain).append('%')
+            d.optJSONArray("astronomy")?.optJSONObject(0)?.let {
+                sb.append("，日出 ").append(it.optString("sunrise"))
+                    .append(" 日落 ").append(it.optString("sunset"))
+            }
+            sb.append('\n')
+        }
+        return sb.toString().trimEnd()
+    }
+
+    /**
+     * wttr.in 的 j1 把每个文本字段都包成 `[{"value": "..."}]`,取值的样板代码太啰嗦,
+     * 这里收口成一个扩展函数。
+     */
+    private fun JSONObject.wttrValue(key: String): String? =
+        optJSONArray(key)?.optJSONObject(0)?.optString("value")?.takeIf { it.isNotBlank() }
+
+    /**
+     * 天气描述。优先中文(`lang=zh-cn` 时字段名就叫 `lang_zh-cn`),
+     * 没有就退回英文 —— 模型自己会把 "Light rain shower" 说成"小阵雨",
+     * 为这个让工具失败不值得。
+     */
+    private fun JSONObject.desc(): String =
+        wttrValue("lang_zh-cn") ?: wttrValue("weatherDesc") ?: "未知"
+
+    /** 反查地名的等待上限。 */
+    private const val GEOCODE_WAIT_SEC = 3L
+
+    /**
+     * 经纬度反查地名。拿不到就返回 null —— 光有经纬度也够查天气了,
+     * 不值得为了个地名让整个工具失败。国行设备上 Geocoder 的后端不一定在。
+     *
+     * 用 API 33 的回调版而不是那个同名的阻塞版:反查要走网络,而这台机器的网络
+     * 可能正绕着代理走,阻塞版没有超时参数,后端一卡就把整个工具拖住 ——
+     * 定位本身明明已经拿到了,不该为了个锦上添花的地名赔上这一轮。
+     */
+    private fun placeName(ctx: Context, loc: Location): String? {
+        if (!Geocoder.isPresent()) return null
+        return try {
+            val latch = CountDownLatch(1)
+            val holder = AtomicReference<String?>(null)
+            Geocoder(ctx, Locale.CHINA).getFromLocation(
+                loc.latitude, loc.longitude, 1,
+                object : Geocoder.GeocodeListener {
+                    override fun onGeocode(addresses: MutableList<Address>) {
+                        holder.set(addresses.firstOrNull()?.let { a ->
+                            listOfNotNull(a.adminArea, a.locality, a.subLocality, a.thoroughfare)
+                                .distinct()
+                                .joinToString("")
+                                .ifBlank { a.getAddressLine(0) }
+                        })
+                        latch.countDown()
+                    }
+
+                    override fun onError(errorMessage: String?) {
+                        Log.i(TAG, "geocode failed: $errorMessage")
+                        latch.countDown()
+                    }
+                }
+            )
+            if (!latch.await(GEOCODE_WAIT_SEC, TimeUnit.SECONDS)) Log.i(TAG, "geocode timed out")
+            holder.get()?.takeIf { it.isNotBlank() }
+        } catch (t: Throwable) {
+            Log.w(TAG, "geocode failed: $t")
+            null
+        }
+    }
 
     /**
      * 注意 `mutating = false`。
