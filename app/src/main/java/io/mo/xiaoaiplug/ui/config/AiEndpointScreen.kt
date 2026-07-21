@@ -23,6 +23,7 @@ import io.mo.xiaoaiplug.config.DEFAULT_SYSTEM_PROMPT
 import io.mo.xiaoaiplug.ui.ConfigViewModel
 import io.mo.xiaoaiplug.ui.TestState
 import io.mo.xiaoaiplug.ui.nav.CardContentPadding
+import io.mo.xiaoaiplug.ui.nav.CardHorizontalPadding
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -33,6 +34,7 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Hide
 import top.yukonga.miuix.kmp.icon.extended.Show
+import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -136,6 +138,25 @@ fun AiEndpointScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
                         insideMargin = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
                     )
                 }
+            }
+        }
+
+        item { SmallTitle("对话上下文") }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                SwitchPreference(
+                    checked = config.contextEnabled,
+                    onCheckedChange = { on -> vm.update { it.copy(contextEnabled = on) } },
+                    title = "记住前几轮说过什么",
+                    summary = "最近一小时内最多带 5 轮问答"
+                )
+                Text(
+                    text = "关掉的话每句话都是独立的，模型看不到上一句。" +
+                        "小爱进程被系统清理后上下文也会清空。",
+                    fontSize = MiuixTheme.textStyles.footnote2.fontSize,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(horizontal = CardHorizontalPadding, vertical = 8.dp)
+                )
             }
         }
 

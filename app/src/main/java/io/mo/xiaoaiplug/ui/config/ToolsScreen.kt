@@ -33,12 +33,9 @@ fun ToolsScreen(vm: ConfigViewModel, bottomInset: Dp, onBack: () -> Unit) {
     }
 
     fun setEnabled(name: String, on: Boolean) {
-        val next = if (on) enabledNames + name else enabledNames - name
-        vm.update {
-            // 全勾选时也存成显式列表：存空串的话以后新增工具会被自动打开，
-            // 用户以为自己关掉的东西又冒出来。（这条语义在旧界面里就有，不能丢。）
-            it.copy(enabledTools = next.joinToString(",").ifEmpty { Tools.NONE })
-        }
+        // 「全勾选时也存显式列表」那条语义已经收进 Tools.withEnabled ——
+        // 记忆页的「个性化录入」开关写的是同一份 csv，逻辑必须共用一份。
+        vm.update { it.copy(enabledTools = Tools.withEnabled(it.enabledTools, name, on)) }
     }
 
     val matched = remember(keyword) {

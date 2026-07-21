@@ -6,6 +6,7 @@ import android.os.Looper
 import android.util.Log
 import io.mo.xiaoaiplug.config.AiClient
 import io.mo.xiaoaiplug.config.AiConfig
+import io.mo.xiaoaiplug.config.ChatHistory
 import io.mo.xiaoaiplug.config.ConfigClient
 import io.mo.xiaoaiplug.hook.SettingsHook
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -1727,7 +1728,16 @@ class HookEntry : IXposedHookLoadPackage {
                 // 接管信号(takeOver / 静音泵)常常比模型调用晚到,一开始就判会误杀。
                 // 不这么关的话,像"打开微信帮我给X发信息"这种命中放行词、本该由小爱
                 // 自己处理的话,我们的模型也会并行跑一遍并真的去 launch_app。
-                val answer = AiClient.chat(config, queryText, currentApplicationContext()) {
+                // 上下文在**发请求前**取一次:一小时窗口内的旧问答,不含本轮。
+                // 开关关着时顺手清空:设置页在**另一个进程**,那边调 clear() 清不到这份内存,
+                // 不在这清的话关了再开会接上一小时前的话茬。
+                val history = if (config.contextEnabled) {
+                    ChatHistory.recent()
+                } else {
+                    ChatHistory.clear()
+                    emptyList()
+                }
+                val answer = AiClient.chat(config, queryText, currentApplicationContext(), history) {
                     val ours = utteranceDialogs[key].orEmpty().any {
                         it in takeOver || it in pendingViewAnswer
                     }
@@ -1735,6 +1745,10 @@ class HookEntry : IXposedHookLoadPackage {
                 }
                 Log.i(TAG, "AI answer ready key=$key: $answer")
                 utteranceAnswers[key] = answer
+                // 答成了才记进历史 —— 失败的轮次不该污染后面的上下文。
+                // 一次问话只走到这里一次(utteranceCalling 挡住了并发,答案命中
+                // utteranceAnswers 缓存的重复提问根本不会再调 startAiCall),所以不会重复记。
+                if (config.contextEnabled) ChatHistory.record(queryText, answer)
                 // 先把卡片/注入/历史都落好,再开口,让画面和声音基本同时到
                 for (id in utteranceDialogs[key].orEmpty()) {
                     applyAnswer(key, id, answer)

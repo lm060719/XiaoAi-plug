@@ -34,12 +34,15 @@ object ConfigKeys {
     // 用 OpenAI 原生 function calling(带 tools 参数)。端点不支持时会自动降级到文本约定。
     const val USE_NATIVE_TOOLS = "use_native_tools"
 
+    // 多轮上下文:把最近一小时内的问答一起发给模型(见 ChatHistory)
+    const val CONTEXT_ENABLED = "context_enabled"
+
     val ALL = listOf(
         PROVIDER, ENDPOINT, API_KEY, MODEL, SYSTEM_PROMPT, ENABLED,
         BLOCK_VIEW_JUMP, JUMP_ALLOW_WORDS,
         BLOCK_WEB_SEARCH, WEB_SEARCH_ALLOW_WORDS,
         SPEAK_ANSWER,
-        ENABLED_TOOLS, USE_NATIVE_TOOLS
+        ENABLED_TOOLS, USE_NATIVE_TOOLS, CONTEXT_ENABLED
     )
 }
 
@@ -70,6 +73,13 @@ class ConfigProvider : ContentProvider() {
         const val LOG_DETAIL = "log_detail"
         const val LOG_DURATION = "log_duration"
         const val LOG_OK = "log_ok"
+
+        // 长期记忆:同样是「数据库在模块进程、工具跑在小爱进程」,过桥。
+        // 跟记录不同的是**读也要过桥** —— 每轮对话都要把已有记忆拼进系统提示词。
+        const val METHOD_MEMORY_SAVE = "memory_save"
+        const val METHOD_MEMORY_LIST = "memory_list"
+
+        const val MEM_CONTENT = "mem_content"
 
         private const val PREFS_NAME = "xiaoai_plug_config"
 
@@ -181,6 +191,37 @@ class ConfigProvider : ContentProvider() {
                 } catch (t: Throwable) {
                     // 记日志失败绝不能反过来把调用方搞挂
                     Bundle().apply { putBoolean("ok", false) }
+                }
+            }
+            METHOD_MEMORY_SAVE -> {
+                // 跟 log_append 的 fire-and-forget 不一样:这是工具调用,模型在等一个
+                // 明确的成功/失败回执,所以同步做完再返回。调用方(MemoryClient)已经
+                // 在 AiClient 的后台线程上了。
+                val content = extras?.getString(MEM_CONTENT).orEmpty()
+                Bundle().apply {
+                    putString(
+                        "result",
+                        try {
+                            MemoryStore.get(context!!)
+                                .append(content, MemoryEntry.SOURCE_AUTO)
+                        } catch (t: Throwable) {
+                            "error: ${t.javaClass.simpleName}: ${t.message}"
+                        }
+                    )
+                }
+            }
+            METHOD_MEMORY_LIST -> {
+                // 每轮对话都会调一次(拼系统提示词)。条数有 MemoryStore.MAX_ROWS 兜着,
+                // 离 Binder 那 1MB 上限还很远。
+                Bundle().apply {
+                    putStringArrayList(
+                        MEM_CONTENT,
+                        try {
+                            ArrayList(MemoryStore.get(context!!).all().map { it.content })
+                        } catch (t: Throwable) {
+                            ArrayList()
+                        }
+                    )
                 }
             }
             else -> null

@@ -25,7 +25,9 @@ data class AiConfig(
     // 允许模型调用的工具,逗号分隔;空串 = 全开
     val enabledTools: String = "",
     // 原生 function calling(默认开,端点不支持会自动降级)
-    val useNativeTools: Boolean = true
+    val useNativeTools: Boolean = true,
+    // 多轮上下文:带上最近一小时内的问答(默认开)。见 ChatHistory。
+    val contextEnabled: Boolean = true
 ) {
     /** 当前服务商。旧存档(provider 为空)落到 [AiProvider.DEFAULT]。 */
     val aiProvider: AiProvider get() = AiProvider.fromKey(provider)
@@ -91,6 +93,7 @@ object ConfigClient {
         val searchAllowRaw = result?.getString(ConfigKeys.WEB_SEARCH_ALLOW_WORDS)
         val speakRaw = result?.getString(ConfigKeys.SPEAK_ANSWER)
         val nativeToolsRaw = result?.getString(ConfigKeys.USE_NATIVE_TOOLS)
+        val contextRaw = result?.getString(ConfigKeys.CONTEXT_ENABLED)
         return AiConfig(
             provider = result?.getString(ConfigKeys.PROVIDER).orEmpty(),
             endpoint = result?.getString(ConfigKeys.ENDPOINT).orEmpty(),
@@ -104,7 +107,8 @@ object ConfigClient {
             webSearchAllowWords = if (searchAllowRaw.isNullOrEmpty()) DEFAULT_WEB_SEARCH_ALLOW_WORDS else searchAllowRaw,
             speakAnswer = speakRaw.isNullOrEmpty() || speakRaw == "true",
             enabledTools = result?.getString(ConfigKeys.ENABLED_TOOLS).orEmpty(),
-            useNativeTools = nativeToolsRaw.isNullOrEmpty() || nativeToolsRaw == "true"
+            useNativeTools = nativeToolsRaw.isNullOrEmpty() || nativeToolsRaw == "true",
+            contextEnabled = contextRaw.isNullOrEmpty() || contextRaw == "true"
         )
     }
 
@@ -124,6 +128,7 @@ object ConfigClient {
             putString(ConfigKeys.SPEAK_ANSWER, config.speakAnswer.toString())
             putString(ConfigKeys.ENABLED_TOOLS, config.enabledTools)
             putString(ConfigKeys.USE_NATIVE_TOOLS, config.useNativeTools.toString())
+            putString(ConfigKeys.CONTEXT_ENABLED, config.contextEnabled.toString())
         }
         return try {
             val out = context.contentResolver.call(uri, ConfigProvider.METHOD_SET, null, extras)

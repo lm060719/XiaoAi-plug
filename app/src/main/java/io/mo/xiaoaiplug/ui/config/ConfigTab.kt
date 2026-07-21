@@ -28,7 +28,7 @@ import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 
 /** 配置 tab 的二级页。null 表示停在入口列表。 */
-enum class ConfigRoute { AI, INTERCEPT, SPEAK, TOOLS }
+enum class ConfigRoute { AI, INTERCEPT, SPEAK, TOOLS, MEMORY }
 
 @Composable
 fun ConfigTab(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
@@ -57,6 +57,7 @@ fun ConfigTab(bottomInset: Dp, vm: ConfigViewModel = viewModel()) {
             ConfigRoute.INTERCEPT -> InterceptScreen(vm, bottomInset) { route = null }
             ConfigRoute.SPEAK -> SpeakScreen(vm, bottomInset) { route = null }
             ConfigRoute.TOOLS -> ToolsScreen(vm, bottomInset) { route = null }
+            ConfigRoute.MEMORY -> MemoryScreen(vm, bottomInset, onBack = { route = null })
         }
     }
 }
@@ -102,6 +103,12 @@ private fun ConfigList(
                     title = "工具",
                     summary = "$enabledToolCount/${Tools.ALL.size} 已启用",
                     onClick = { onOpen(ConfigRoute.TOOLS) }
+                )
+                ArrowPreference(
+                    title = "记忆",
+                    summary = if (Tools.isEnabled(config.enabledTools, Tools.SAVE_MEMORY))
+                        "个性化录入已开启" else "个性化录入已关闭",
+                    onClick = { onOpen(ConfigRoute.MEMORY) }
                 )
             }
         }

@@ -63,6 +63,7 @@ object AiClient {
     private data class Call(val name: String, val args: JSONObject, val id: String?)
 
     /**
+     * @param history 之前几轮的问答(由旧到新),拼在本轮提问前面当上下文。见 [ChatHistory]。
      * @param allowMutating 每次工具执行时求值:本轮是否确实由我们接管。
      *   false 时动作类工具(launch_app / set_setting / …)被拒绝执行。
      *   见 Tools.Spec.mutating 上的事故说明。
@@ -71,13 +72,14 @@ object AiClient {
         config: AiConfig,
         userText: String,
         ctx: Context? = null,
+        history: List<ChatTurn> = emptyList(),
         allowMutating: () -> Boolean = { true }
     ): String {
         // 包一层只为埋点:chatInternal 有三个 return 点,逐个改容易漏。
         // 失败原样往上抛,不改变调用方(HookEntry)看到的行为。
         val started = System.currentTimeMillis()
         return try {
-            val answer = chatInternal(config, userText, ctx, allowMutating)
+            val answer = chatInternal(config, userText, ctx, history, allowMutating)
             LogClient.chat(ctx, userText, answer, config.effectiveModel, System.currentTimeMillis() - started)
             answer
         } catch (t: Throwable) {
@@ -95,6 +97,7 @@ object AiClient {
         config: AiConfig,
         userText: String,
         ctx: Context?,
+        history: List<ChatTurn>,
         allowMutating: () -> Boolean
     ): String {
         val specs = Tools.enabled(config.enabledTools)
@@ -109,9 +112,27 @@ object AiClient {
         sysParts.add(config.effectiveSystemPrompt)
         // 文本约定模式下必须把工具表告诉模型;原生模式下 tools 参数已经带了,再塞一遍是浪费 token。
         if (!useNative && specs.isNotEmpty()) sysParts.add(Tools.toPromptSpec(specs))
+        // 已有记忆无条件注入,**跟「记忆个性化录入」开关无关** —— 那个开关管的是模型能不能
+        // 自己往里写(即 save_memory 工具的启停)。用户手填的记忆不该因为关了自动录入就失效。
+        val memories = MemoryClient.list(ctx)
+        if (memories.isNotEmpty()) {
+            sysParts.add(
+                "以下是你记住的关于用户的信息，回答时自然地用上，不要主动复述或提起「我记得」：\n" +
+                    memories.joinToString("\n") { "- $it" }
+            )
+        }
         if (sysParts.isNotEmpty()) {
             messages.put(JSONObject().put("role", "system").put("content", sysParts.joinToString("\n\n")))
         }
+        // 历史一律走 user/assistant 交替的普通消息,**不能**用 role=system ——
+        // postAnthropic 会把所有 system 消息折进顶层 system 字段(见那边的注释),
+        // 上下文就变成系统提示词的一部分了。
+        for (turn in history) {
+            messages.put(JSONObject().put("role", "user").put("content", turn.question))
+            messages.put(JSONObject().put("role", "assistant").put("content", turn.answer))
+        }
+        if (history.isNotEmpty()) Log.i(TAG, "carrying ${history.size} turns of context")
+
         messages.put(JSONObject().put("role", "user").put("content", userText))
 
         var lastContent = ""

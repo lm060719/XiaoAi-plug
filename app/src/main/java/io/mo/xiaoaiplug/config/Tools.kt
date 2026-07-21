@@ -69,11 +69,18 @@ object Tools {
             listApps, launchApp, sendMessage, readFile,
             getSetting, setSetting,
             mediaControl, setVolume,
-            currentTime, recentNotifications
+            currentTime, recentNotifications,
+            saveMemory
         )
     }
 
     private val byName: Map<String, Spec> by lazy { ALL.associateBy { it.name } }
+
+    /**
+     * 「记忆个性化录入」开关背后就是这个工具的启停 —— 记忆页那个开关和工具页里
+     * save_memory 那个开关读写的是**同一份状态**,不是两个各自为政的配置项。
+     */
+    const val SAVE_MEMORY = "save_memory"
 
     /** 用户把工具全关掉时存这个,以区别于"老存档里压根没有这个字段"(空串 = 全开)。 */
     const val NONE = "none"
@@ -84,6 +91,20 @@ object Tools {
         if (csv.trim() == NONE) return emptyList()
         val want = csv.split(',', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
         return ALL.filter { it.name in want }
+    }
+
+    fun isEnabled(csv: String, name: String): Boolean = enabled(csv).any { it.name == name }
+
+    /**
+     * 开/关单个工具,返回新的 csv。
+     *
+     * 全勾选时也存显式列表、不存空串:存空串的话以后新增的工具会被自动打开,
+     * 用户以为自己关掉的东西又冒出来。(这条语义原先只写在工具页里,提上来共用。)
+     */
+    fun withEnabled(csv: String, name: String, on: Boolean): String {
+        val cur = enabled(csv).map { it.name }.toSet()
+        val next = if (on) cur + name else cur - name
+        return next.joinToString(",").ifEmpty { NONE }
     }
 
     /**
@@ -937,6 +958,31 @@ object Tools {
         modelHint = "含包名、标题、正文。用户问「刚才来了什么通知」「有没有新消息」时用。",
         handler = { _, _ ->
             sh("dumpsys notification --noredact | grep -E 'pkg=|android.title=|android.text=' | head -n 60")
+        }
+    )
+
+    /**
+     * 注意 `mutating = false`。
+     *
+     * [Spec.mutating] 的语义是"会改变**设备**状态,本轮不归我们就必须拦下"
+     * (见上面那段事故注释)。写一条记忆不碰设备,而且用户提到自己信息的那句话
+     * 常常正好是小爱自己接管的轮次 —— 标成 mutating 的话恰恰在最该记的时候记不下来。
+     */
+    private val saveMemory = Spec(
+        name = SAVE_MEMORY,
+        description = "记住关于用户的长期信息(口味、家庭成员、习惯、称呼等)",
+        modelHint = "用户在闲聊中透露出以后还用得上的个人信息时**主动**调用，不用先征求同意，" +
+                "也不用在回答里提起「我记住了」。一次一条，写成自包含的陈述句" +
+                "（「用户对花生过敏」而不是「对，是的」）。" +
+                "只记稳定的事实，不要记一次性的东西（今天几点开会、刚才问的天气）。" +
+                "已经记过的会自动去重，不用担心重复。",
+        params = listOf(
+            Param("content", "string", "要记住的一句话，自包含的陈述句", required = true)
+        ),
+        handler = { args, ctx ->
+            val content = args.optString("content", "").trim()
+            if (content.isEmpty()) "error: content 为空"
+            else MemoryClient.save(ctx, content)
         }
     )
 

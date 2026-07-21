@@ -101,6 +101,7 @@ class ConfigRepository private constructor(context: Context) {
         webSearchAllowWords = DEFAULT_WEB_SEARCH_ALLOW_WORDS,
         speakAnswer = true,
         enabledTools = "",
-        useNativeTools = true
+        useNativeTools = true,
+        contextEnabled = true
     )
 }
