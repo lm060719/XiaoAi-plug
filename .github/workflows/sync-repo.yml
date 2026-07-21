@@ -1,4 +1,4 @@
-name: Sync to Xposed-Modules-Repo
+﻿name: Sync to Xposed-Modules-Repo
 
 on:
   push:
@@ -51,51 +51,20 @@ jobs:
           NAME="${{ github.event.release.name }}"
           PRERELEASE="${{ github.event.release.prerelease }}"
 
-          # Use Python to safely handle JSON with special characters
-          python3 - "$TAG" "$NAME" "$PRERELEASE" <<'PYEOF'
-          import sys, json, urllib.request, os
-
-          tag = sys.argv[1]
-          name = sys.argv[2]
-          prerelease = sys.argv[3].lower() == "true"
-          token = os.environ["SYNC_TOKEN"]
-          repo = "Xposed-Modules-Repo/io.mo.xiaoaiplug"
-
-          # Get release body from the source release
-          src_release_url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{tag}"
-          req = urllib.request.Request(src_release_url, headers={"Authorization": f"token {token}"})
-          try:
-              src = json.loads(urllib.request.urlopen(req).read())
-              body = src.get("body", "")
-          except Exception:
-              body = ""
+          # Get release body from source
+          BODY=$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq '.body' 2>/dev/null || echo "")
 
           # Delete existing release on target if present
-          try:
-              target_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-              req2 = urllib.request.Request(target_url, headers={"Authorization": f"token {token}"})
-              existing = json.loads(urllib.request.urlopen(req2).read())
-              del_url = f"https://api.github.com/repos/{repo}/releases/{existing['id']}"
-              req3 = urllib.request.Request(del_url, data=b"", headers={"Authorization": f"token {token}"}, method="DELETE")
-              urllib.request.urlopen(req3)
-              print(f"Deleted existing release for {tag}")
-          except Exception:
-              pass
+          EXISTING_ID=$(gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/tags/${TAG} --jq '.id' 2>/dev/null || echo "")
+          if [ -n "$EXISTING_ID" ]; then
+            gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/${EXISTING_ID} --method DELETE || true
+            echo "Deleted existing release for ${TAG}"
+          fi
 
           # Create new release on target
-          payload = json.dumps({
-              "tag_name": tag,
-              "name": name,
-              "body": body,
-              "prerelease": prerelease
-          }).encode()
-
-          create_url = f"https://api.github.com/repos/{repo}/releases"
-          req4 = urllib.request.Request(create_url, data=payload, headers={
-              "Authorization": f"token {token}",
-              "Content-Type": "application/json"
-          })
-          resp = json.loads(urllib.request.urlopen(req4).read())
-          print(f"Created release: {resp.get('html_url', 'unknown')}")
-          print(f"Upload URL: {resp.get('upload_url', 'none')}")
-PYEOF
+          gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases \
+            --method POST \
+            -f tag_name="${TAG}" \
+            -f name="${NAME}" \
+            -f body="${BODY}" \
+            -F prerelease="${PRERELEASE}"
