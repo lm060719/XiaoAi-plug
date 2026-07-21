@@ -410,8 +410,9 @@ object Tools {
             val raw = sh(MEM_CMD, limit = 512 * 1024)
             var procs = parseProcMem(raw)
             // ps 的 -o 选项在别的 ROM 上不一定支持;真解析不出来再退回慢但通用的 dumpsys
-            if (procs.isEmpty()) {
-                Log.i(TAG, "ps/smaps path yielded nothing, falling back to dumpsys meminfo")
+            if (procs.size < MIN_PLAUSIBLE_PROCS) {
+                Log.i(TAG, "ps/smaps path yielded only ${procs.size} procs, " +
+                        "falling back to dumpsys meminfo")
                 procs = parseMeminfo(sh(MEM_CMD_FALLBACK, limit = 512 * 1024))
             }
             if (procs.isEmpty()) return@Spec "error: 没能解析出内存占用(可能没有 root 权限)"
@@ -474,6 +475,30 @@ object Tools {
         append("echo '--MEM--'; grep -E 'MemTotal|MemAvailable' /proc/meminfo")
     }
 
+    /**
+     * ps 这条路少于这么多个进程就判定为"没采到",退回 dumpsys。
+     *
+     * MEM_CMD 里是 `head -40`,任何一台正常开机的机器都必然凑满 40 条,所以这个阈值
+     * 不会误伤。它防的是**采到了几条、但全是垃圾**的情况 —— 早先这里只判 `isEmpty()`,
+     * 于是真机上翻车:HyperOS 把应用的 /proc 挂成 `hidepid=invisible`(见
+     * `/proc/<pid>/mountinfo`),而我们 su 出来的 root **没有 READPROC(gid 3009)
+     * 补充组、也没有 CAP_SYS_PTRACE**(KernelSU 按 App Profile 授权,不一定是完整 root),
+     * 于是 `ps -A` 只看得见 su 自己拉起来的 ps/sh 两三个进程。
+     * 非空 → 不触发 fallback → 工具一本正经地回"内存占用前 10 名:1. ps — 5MB"。
+     * 模型不信这个结果,换 include_system 再调、再改用 run_shell 手搓 ps,
+     * 六轮 MAX_TOOL_ITERATIONS 烧光,用户看到"工具调用超过上限,未得到最终答案"。
+     *
+     * dumpsys 走 binder 问 AMS,不读 /proc,所以完全不受 hidepid 影响 —— 这也是为什么
+     * 判据要落在"结果像不像真的"上,而不是"命令有没有报错":那条 ps 是**成功返回**的。
+     */
+    private const val MIN_PLAUSIBLE_PROCS = 20
+
+    /**
+     * su 自己这一串管道进程。正常情况下它们 RSS 只有几 MB、排不进前 40,
+     * 但 hidepid 挡住别人时它们就是全部,列出来纯属噪音。
+     */
+    private val SHELL_NOISE = setOf("ps", "sh", "sort", "head", "grep", "wc", "toybox", "awk")
+
     /** ps -o 不被支持时的退路:慢(5 秒+)但哪儿都有。 */
     private const val MEM_CMD_FALLBACK =
         "dumpsys meminfo | awk '/by process:/{p=1} /by OOM adjustment:/{p=0} p';" +
@@ -509,6 +534,7 @@ object Tools {
         }
         return names.entries
             .mapNotNull { (pid, name) ->
+                if (name.substringAfterLast('/') in SHELL_NOISE) return@mapNotNull null
                 val kb = pss[pid] ?: rss[pid] ?: return@mapNotNull null
                 name to kb
             }
@@ -520,24 +546,40 @@ object Tools {
      *   `   350,123K: com.tencent.mm (pid 1234 / activities)`
      * 数字带千位逗号,得先去掉再转 Long。
      *
-     * 只认第一个 "by process" 段:输出里 PSS 和 RSS 两张表都在,
-     * 两段都收会让同一个应用出现两次、数字还对不上。
+     * 输出里 PSS 和 RSS 两张表都在,**只能收一张** —— 两段都收会让同一个应用出现两次、
+     * 数字还对不上。按表头挑 PSS,理由和 ps 那条路一样:RSS 把共享页在每个进程里重复计,
+     * 虚高且会带偏排名。
+     *
+     * 注意这张 PSS 表的数字会**大于**同一次 dumpsys 里的 RSS(实测微信 RSS 304MB /
+     * PSS 617MB)。纯 PSS 不可能超过 RSS,多出来的是换出到 ZRAM 的那部分 —— MIUI 压缩
+     * 内存用得凶,这些页不驻留所以不计进 RSS,但确实还是这个应用占着的。问"内存被谁吃了"
+     * 的时候算上它更贴题,所以不做修正。
+     *
+     * 不能按出现顺序挑:老版本 Android 是 PSS 在前,Android 14 起默认不算 PSS,
+     * 这台 HyperOS 上是 `Total RSS by process:` 在前、PSS 在后。原先"取第一张表"的写法
+     * 在这里恰好取到了 RSS。PSS 表缺席时(有些 ROM 真的只给 RSS)退回第一张有内容的表。
      */
     private fun parseMeminfo(raw: String): List<Pair<String, Long>> {
-        val out = ArrayList<Pair<String, Long>>()
         val line = Regex("^\\s*([\\d,]+)K:\\s+(\\S+)")
-        var inSection = false
+        val tables = LinkedHashMap<String, MutableList<Pair<String, Long>>>()
+        var cur: MutableList<Pair<String, Long>>? = null
         for (l in raw.lineSequence()) {
             if (l.contains("by process:")) {
-                if (inSection || out.isNotEmpty()) break   // 第二张表(RSS),到此为止
-                inSection = true
+                cur = tables.getOrPut(l.trim()) { ArrayList() }
                 continue
             }
-            if (!inSection) continue
-            val m = line.find(l) ?: continue
-            out.add(m.groupValues[2] to m.groupValues[1].replace(",", "").toLong())
+            val m = line.find(l)
+            if (m == null) {
+                // 表和表之间夹着别的段落(OOM adjustment、category…),空行不算结束,
+                // 但一碰到不认识的正文就收手,免得把隔壁段的数字吃进来。
+                if (l.isNotBlank()) cur = null
+                continue
+            }
+            cur?.add(m.groupValues[2] to m.groupValues[1].replace(",", "").toLong())
         }
-        return out
+        val pick = tables.entries.firstOrNull { it.key.contains("PSS", true) && it.value.isNotEmpty() }
+            ?: tables.entries.firstOrNull { it.value.isNotEmpty() }
+        return pick?.value?.sortedByDescending { it.second }.orEmpty()
     }
 
     private fun mb(kb: Long): String =
