@@ -23,6 +23,7 @@ jobs:
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
+          git config --global credential.helper ""
           git remote add target "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git"
           git push target master --force
 
@@ -39,6 +40,7 @@ jobs:
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
+          git config --global credential.helper ""
           git remote add target "https://x-access-token:${SYNC_TOKEN}@github.com/Xposed-Modules-Repo/io.mo.xiaoaiplug.git"
           git push target master --force
           git push target --tags --force
@@ -46,22 +48,20 @@ jobs:
       - name: Sync release to target repo
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           TAG="${{ github.event.release.tag_name }}"
           NAME="${{ github.event.release.name }}"
           PRERELEASE="${{ github.event.release.prerelease }}"
 
-          # Get release body from source
-          BODY=$(gh api repos/${{ github.repository }}/releases/tags/${TAG} --jq '.body' 2>/dev/null || echo "")
+          BODY=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq '.body' 2>/dev/null || echo "")
 
-          # Delete existing release on target if present
-          EXISTING_ID=$(gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/tags/${TAG} --jq '.id' 2>/dev/null || echo "")
+          EXISTING_ID=$(gh api "repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/tags/${TAG}" --jq '.id' 2>/dev/null || echo "")
           if [ -n "$EXISTING_ID" ]; then
-            gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/${EXISTING_ID} --method DELETE || true
+            gh api "repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases/${EXISTING_ID}" --method DELETE || true
             echo "Deleted existing release for ${TAG}"
           fi
 
-          # Create new release on target
           gh api repos/Xposed-Modules-Repo/io.mo.xiaoaiplug/releases \
             --method POST \
             -f tag_name="${TAG}" \
