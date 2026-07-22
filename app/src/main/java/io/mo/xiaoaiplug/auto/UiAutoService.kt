@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.icu.text.Transliterator
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -25,6 +26,16 @@ import android.view.accessibility.AccessibilityNodeInfo
  * 无障碍服务能看到它被授权的所有应用的全部界面内容,范围能小就小。
  */
 class UiAutoService : AccessibilityService() {
+
+    /**
+     * 汉字转拉丁(带声调)的 ICU 实例。`Latin-ASCII` 那一段把声调符号去掉,
+     * 免得取到的"首字母"是个带调的字符(ǎ 之类)。构造一次复用。
+     */
+    private val han2latin: Transliterator? by lazy {
+        runCatching { Transliterator.getInstance("Han-Latin; Latin-ASCII") }
+            .onFailure { Log.w(TAG, "ICU Han-Latin 不可用,发消息将只用全名搜索", it) }
+            .getOrNull()
+    }
 
     companion object {
         private const val TAG = "XiaoAiProbe"
@@ -174,6 +185,29 @@ class UiAutoService : AccessibilityService() {
     }
 
     /**
+     * 汉字 → 拼音首字母:`文件传输助手` → `wjcszs`。
+     *
+     * 用系统自带的 ICU(minSdk 33,android.icu 一定在),不引第三方拼音库。
+     *
+     * 返回空串表示"没有可用的首字母写法,别用它搜":
+     *  - 名字里压根没有汉字(纯英文/数字昵称)—— 那样取首字母只会得到一个字母,
+     *    搜出来一大片,不如直接用原名。
+     *  - ICU 不认识这个转换 ID(理论上不会,但拿不到就退回全名,别让整条链路断掉)。
+     */
+    private fun pinyinInitials(name: String): String {
+        val hasHan = name.any { Character.UnicodeScript.of(it.code) == Character.UnicodeScript.HAN }
+        if (!hasHan) return ""
+        val latin = runCatching { han2latin?.transliterate(name) }.getOrNull() ?: return ""
+        // transliterate 出来是按音节用空格分开的:"wén jiàn chuán shū zhù shǒu"
+        val sb = StringBuilder()
+        for (syllable in latin.trim().split(Regex("\\s+"))) {
+            val c = syllable.firstOrNull { it.isLetterOrDigit() } ?: continue
+            sb.append(c.lowercaseChar())
+        }
+        return sb.toString()
+    }
+
+    /**
      * 往输入框写文本。优先 ACTION_SET_TEXT;失败退回剪贴板粘贴 ——
      * 中文没法走 `input text`(只认 ASCII),微信的自定义输入框也不一定吃 SET_TEXT。
      */
@@ -287,16 +321,39 @@ class UiAutoService : AccessibilityService() {
         if (back > 0) Log.i(TAG, "backed out $back screens to reach WeChat home")
         if (!click(searchBtn)) return "error: 点搜索按钮失败"
 
-        // 2. 输入联系人名。轮询等搜索页真正出现 —— 点击后立刻查会查到旧页面。
-        val searchInput = waitForNode { it.isEditable && it.isVisibleToUser }
-            ?: return "error: 没找到搜索输入框"
-        if (!setText(searchInput, contact)) return "error: 无法写入搜索框"
+        // 2+3. 往搜索框输入 → 在结果里找**完全同名**的那条。
+        //
+        // 先试拼音首字母(文件传输助手 → wjcszs),搜不到再用全名兜底。
+        // 为什么不直接换成首字母:多音字会算错(长 cháng/zhǎng、重 chóng/zhòng、
+        // 曾 zēng/céng…),ICU 只会给一个读音,和微信的索引对不上就搜不到人。
+        // 兜底那一步保证最差也就退回原来的行为。
+        //
+        // **匹配规则一个字没改**:仍然要求结果里有一条 text 和 contact 完全相同。
+        // 搜索框里输什么只影响"能不能搜出来",点谁始终由全名精确匹配决定 ——
+        // 发错人没法撤回,这条底线不能因为换了搜法就松。
+        val queries = listOf(pinyinInitials(contact), contact)
+            .filter { it.isNotBlank() }.distinct()
+        Log.i(TAG, "searching \"$contact\" via ${queries.joinToString(" → ")}")
 
-        // 3. 结果里找**完全同名**的那条。
-        // 注意排除搜索框自己:输入 contact 之后它的 text 也等于 contact,
-        // 不排掉的话会"点中"输入框,永远进不了会话。
-        val hit = waitForNode(5000) {
-            it.text?.toString() == contact && it.isVisibleToUser && !it.isEditable
+        var hit: AccessibilityNodeInfo? = null
+        for ((i, q) in queries.withIndex()) {
+            val searchInput = waitForNode { it.isEditable && it.isVisibleToUser }
+                ?: return "error: 没找到搜索输入框"
+            if (!setText(searchInput, q)) return "error: 无法写入搜索框"
+
+            // 注意排除搜索框自己:输入的内容等于 contact 时(全名那次)它的 text
+            // 也等于 contact,不排掉的话会"点中"输入框,永远进不了会话。
+            //
+            // 还要等的时间:最后一次给足 5 秒(和改动前一致);前面的尝试给 2.5 秒,
+            // 失败了还有下一手,不值得每次都干等满。
+            hit = waitForNode(if (i == queries.lastIndex) 5000 else 2500) {
+                it.text?.toString() == contact && it.isVisibleToUser && !it.isEditable
+            }
+            if (hit != null) {
+                Log.i(TAG, "matched \"$contact\" by query \"$q\"")
+                break
+            }
+            Log.i(TAG, "query \"$q\" got no exact match for \"$contact\"")
         }
         if (hit == null) {
             // 只列**像联系人名**的短文本(≤16字)。搜索结果页同时也会显示聊天记录摘要,

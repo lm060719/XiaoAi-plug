@@ -132,12 +132,13 @@ private val VIEW_WORDS = listOf(
 private val SEND_MESSAGE_APPS = listOf("微信", "wechat")
 private val SEND_MESSAGE_VERBS = listOf("发消息", "发信息", "发条", "发个", "告诉", "说一声", "带句话")
 
-// 判定"跳转目标确实是系统设置/系统应用",避免误伤导航/打开第三方应用之类的正常跳转
-private val SETTINGS_PACKAGES = setOf(
-    "com.android.settings", "com.miui.securitycenter", "com.miui.securitycore",
-    "com.miui.powerkeeper", "com.miui.networkassistant", "com.xiaomi.misettings"
-)
+// 「给<对象>发<内容>」的句式。词表补不完 —— 实测「打开微信给文件传输助手**发你好**」
+// 就一个都匹配不上(表里最接近的是"发个"),整句被当成"打开微信"处理,发消息彻底失效。
+// 内容是任意的("发你好"/"发我到了"/"发个链接"),但结构稳定:给 + 对象 + 发。
+// 限长是为了不跨句误匹配("给我查一下天气顺便发..."这种)。
+private val SEND_MESSAGE_PATTERN = Regex("给.{1,15}?发")
 
+// 判定"跳转目标确实是系统设置/系统应用",避免误伤导航/打开第三方应用之类的正常跳转
 class HookEntry : IXposedHookLoadPackage {
 
     /** 把本模块进程里的 ModuleStatus.isActive() 替换成返回 true(见 ModuleStatus 的注释)。 */
@@ -186,6 +187,21 @@ class HookEntry : IXposedHookLoadPackage {
     @Volatile private var lastQueryTime: Long = 0L
     @Volatile private var lastDialogId: String = ""
     @Volatile private var lastConfig: AiConfig? = null
+
+    /**
+     * **终态 ASR 原文**,和 [lastQueryText] 分开存。
+     *
+     * 小爱会改写问话再交给 setQueryInfo,实测:
+     *   "打开系统更新" → "系统更新"      (放行词"打开"没了)
+     *   "查看系统版本" → "查看版本"      ("系统"没了)
+     * 而 [lastQueryText] 会被后到的 setQueryInfo 覆盖,于是判定看到的是**残缺版**。
+     * 后果是双向的:放行词被吃掉 → 该放行的跳转被拦;查看词被吃掉 → 该拦的没拦。
+     * 前者更糟 —— 用户明确说了"打开",我们却把它挡了。
+     *
+     * 所以两个文本都留着,判定时取并集(见 [viewBlockCandidateNow])。
+     */
+    @Volatile private var lastAsrText: String = ""
+    @Volatile private var lastAsrTime: Long = 0L
 
     @Volatile private var targetClassLoader: ClassLoader? = null
 
@@ -320,7 +336,7 @@ class HookEntry : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
                             val intent = param.args[0] as? android.content.Intent ?: return
-                            if (!shouldBlockJump(intent)) return
+                            if (!ownsCurrentTurn()) return
                             Log.i(TAG, "block view-jump: query=\"$lastQueryText\" intent=$intent")
                             // 返回类型可能是 boolean/int,给个"成功"值,避免上层误判失败
                             param.result = when (m.returnType) {
@@ -402,12 +418,24 @@ class HookEntry : IXposedHookLoadPackage {
                         if (text != lastQueryText) stopMutePump()
                         lastQueryText = text
                         lastQueryTime = System.currentTimeMillis()
+                        // 原文单独留一份 —— 稍后 setQueryInfo 会用改写过的版本覆盖 lastQueryText
+                        lastAsrText = text
+                        lastAsrTime = lastQueryTime
                         if (dialogId.isNotBlank()) lastDialogId = dialogId
                         Log.i(TAG, "asr final: dialogId=$dialogId text=$text")
 
-                        // 这一刻就能判定"这句我们自己答" → 立刻起泵,比小爱起播早得多
+                        // 这一刻就能判定"这句我们自己答" → 立刻起泵,比小爱起播早得多。
+                        //
+                        // 发消息类**必须**和查看类一样在这里起泵,不能只靠 setQueryInfo 那处。
+                        // 实测「打开微信给文件传输助手发你好」:
+                        //   41.625 asr final → 41.924 SpeechSynthesizer.Speak(小爱 299ms 就开口)
+                        //   → 42.008 mute pump started(setQueryInfo 路径,383ms)
+                        // 晚了 84ms,那句"暂不支持微信双开功能"就漏出去了 —— 现象是先播报
+                        // 失败话术、然后消息才被我们发出去。查看类当初就是因为这个把泵前移到
+                        // 这里的(见 setQueryInfo 那处注释),发消息这条路当时漏打了。
                         if (config != null && config.enabled && config.speakAnswer &&
-                            isViewBlockCandidate(text, config) && dialogId.isNotBlank()
+                            dialogId.isNotBlank() &&
+                            (isViewBlockCandidate(text, config) || isSendMessageCommand(text))
                         ) {
                             pendingViewAnswer.add(dialogId)
                             startMutePump(dialogId)
@@ -459,36 +487,7 @@ class HookEntry : IXposedHookLoadPackage {
                             // 注意:这类固定话术 Operation 的 dialogId 是合成字面量
                             // ("fakeDialogId"/"fakeErrorDialogId"),**不是**真实对话 id,
                             // 匹配不上很正常。用"静音泵是否在为当前交互运行"来判定这轮是否归我们。
-                            val ours = opDialogId in pendingViewAnswer || opDialogId in takeOver
-                            if (!ours && !isMutePumpActive()) return
-
-                            // 认领这张卡:归到我们当前正在服务的那个 dialogId 名下
-                            val did = mutePumpDialogId.ifBlank { lastDialogId }
-                            if (did.isBlank()) return
-
-                            // 一轮里这个 hook 会命中**两个**对象:先是 card.e(没有
-                            // updateCardText),再是 FlowTemplateToastCard(有)。后登记的覆盖
-                            // 先登记的,所以实测一直是能更新的那张赢 —— 但那是顺序运气。
-                            // 顺序一旦反过来,我们就攥着一张改不了字的卡,答案永远不上屏,
-                            // 现象就是"这轮没有卡片"。只认真正能改字的。
-                            val updater = try {
-                                card.javaClass.getMethod("updateCardText", String::class.java)
-                            } catch (t: Throwable) {
-                                Log.i(TAG, "skip non-updatable card@${System.identityHashCode(card)}" +
-                                        " class=${card.javaClass.name}")
-                                return
-                            }
-                            val text = aiAnswers[did] ?: THINKING_PLACEHOLDER
-                            answerCards[did] = WeakReference(card)
-                            ourCardTexts[System.identityHashCode(card)] = text
-                            try {
-                                updater.invoke(card, text)
-                            } catch (t: Throwable) {
-                                Log.i(TAG, "commandeer: updateCardText failed: $t")
-                            }
-                            commandeeredCards.add(System.identityHashCode(card))
-                            Log.i(TAG, "commandeered toast card@${System.identityHashCode(card)}" +
-                                    " opDialogId=$opDialogId -> dialogId=$did")
+                            claimToastCard(card, opDialogId, via = "vd.${m.name}")
                         } catch (t: Throwable) {
                             Log.i(TAG, "hookToastCard error: $t")
                         }
@@ -557,23 +556,11 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
-    // 这条 Agent Action 是不是"查看类问话触发的、去系统设置页"的跳转
+    // 这条 Agent Action 该不该拦。判据同 shouldBlockJump:只看这一轮归不归我们,
+    // 不看动作打向哪个包。specs 只用来确认"这确实是条动作指令"。
     private fun shouldBlockAgentAction(specs: List<String>): Boolean {
-        val cfg = lastConfig ?: return false
-        if (!cfg.blockViewJump) return false
-        if (System.currentTimeMillis() - lastQueryTime > 12_000L) return false
-        if (!isViewBlockCandidate(lastQueryText, cfg)) return false
-        return specs.any { isSettingsActionSpec(it) }
-    }
-
-    // action spec 形如:
-    //   urn:aiot-spec-v3:com.mi.phones:action:[com.miui.securitycenter/powercenter/go_power_model_setting]:0:1.0
-    // 取方括号里第一段作为目标包名,落在系统设置类包里才算跳设置。
-    private fun isSettingsActionSpec(spec: String): Boolean {
-        val inner = spec.substringAfter('[', "").substringBefore(']', "")
-        if (inner.isEmpty()) return false
-        val pkg = inner.substringBefore('/')
-        return pkg in SETTINGS_PACKAGES
+        if (specs.isEmpty()) return false
+        return ownsCurrentTurn()
     }
 
     // 白名单直通命中的正则,编译失败(用户手写的正则语法有误)就当不生效处理,别把整个接管功能拖垮
@@ -597,17 +584,31 @@ class HookEntry : IXposedHookLoadPackage {
         return regex?.containsMatchIn(q) == true
     }
 
+    // 命中放行词 = 用户明确要"打开/启动"点什么,而不是在问问题
+    private fun hitsJumpAllowWord(q: String, cfg: AiConfig): Boolean {
+        val allowWords = cfg.jumpAllowWords.split(',', ' ', '，', '、')
+            .map { it.trim() }.filter { it.isNotEmpty() }
+        return allowWords.any { q.contains(it) }
+    }
+
     // 判定一句话是不是"查看类、应拦跳转"的候选(不含跳转目标判定,那个只在 startActivitySafely 时才知道)
     private fun isViewBlockCandidate(q: String, cfg: AiConfig): Boolean {
         if (!cfg.blockViewJump) return false
         if (q.isBlank()) return false
-        // 命中放行词 → 用户明确要"打开",放行
-        val allowWords = cfg.jumpAllowWords.split(',', ' ', '，', '、')
-            .map { it.trim() }.filter { it.isNotEmpty() }
-        if (allowWords.any { q.contains(it) }) return false
+        if (hitsJumpAllowWord(q, cfg)) return false
         // 必须是"查看类"问话
         return VIEW_WORDS.any { q.contains(it) }
     }
+
+    // 这里曾经有个 isNativeLaunchCommand():想让"打开X"这类纯指令跳过模型调用。
+    // 已撤销,两个理由都是实测打脸的:
+    //  1) 它要解决的问题不存在 —— 以为"打开系统更新"末尾会白播一句"没有得到答案",
+    //     实际日志里紧跟着就是 "not taken over, skip speaking",那句话从来没被念出来。
+    //     真实收益只是省一次模型调用,用户感知不到。
+    //  2) 代价是真的 —— "打开微信给文件传输助手发你好"里"发你好"不在 SEND_MESSAGE_VERBS,
+    //     isSendMessageCommand 认不出来,整句被当成"打开微信"直接早退,发消息彻底失效。
+    // 顺带记一笔:就算不撤,它在这条路上也基本失灵 —— setQueryInfo 拿到的文本是
+    // 小爱改写过的("打开系统更新"→"系统更新"),放行词"打开"到这一步已经没了。
 
     /**
      * 是不是"让某个应用给某人发消息"。命中即由我们接管:起静音泵按住小爱那句
@@ -616,25 +617,66 @@ class HookEntry : IXposedHookLoadPackage {
     private fun isSendMessageCommand(q: String): Boolean {
         if (q.isBlank()) return false
         if (SEND_MESSAGE_APPS.none { q.contains(it, ignoreCase = true) }) return false
-        return SEND_MESSAGE_VERBS.any { q.contains(it) }
+        // 先按句式认(覆盖"发<任意内容>"),认不出再退回动词表(覆盖"告诉X…""带句话"这种没有"发"的)
+        return SEND_MESSAGE_PATTERN.containsMatchIn(q) || SEND_MESSAGE_VERBS.any { q.contains(it) }
     }
 
-    // 判定这次跳转是否属于"查看类语音触发的、去系统设置页"的跳转,需要拦掉
-    private fun shouldBlockJump(intent: android.content.Intent): Boolean {
+    /**
+     * 这一轮交互归不归我们 —— 所有"要不要拦"的判定都问这一个问题。
+     *
+     * **刻意不看跳转目标是哪个 App。** 早先的做法是"问话是查看类 **且** 目标在
+     * SETTINGS_PACKAGES 白名单里"才拦,那个白名单是个填不完的坑:实测"查看系统版本"
+     * 跳的是 com.android.updater(「系统更新」是独立 app,不在设置里),不在名单里就漏了;
+     * 而且它的失败是静默的 —— 跳转照常发生,日志里没有任何异常,只能靠真机复现才发现。
+     *
+     * 真正的判据在更上游:setQueryInfo 那一刻(比跳转早约 300ms)如果判定这句是查看类,
+     * 就已经 pendingViewAnswer.add + 起静音泵 + 调模型了,"这轮我们自己答"是既成事实。
+     * 此时小爱还要起 Activity,错不在"目标像不像设置",而在这轮已经不归它了 ——
+     * 跳 App 是它回答问题的方式,而它的答案已经被我们抢走。
+     *
+     * 所以目标是什么包根本不重要,判据只剩:用户是在**问问题**(而不是让"打开"什么),
+     * 且这次跳转和那句问话属于同一次交互。
+     */
+    private fun ownsCurrentTurn(): Boolean {
         val cfg = lastConfig ?: return false
         // 问话要足够新(和这次跳转是同一次交互);太旧就不管,避免误伤后续手动/其它跳转
         if (System.currentTimeMillis() - lastQueryTime > 12_000L) return false
-        if (!isViewBlockCandidate(lastQueryText, cfg)) return false
-        // 跳转目标必须确实是系统设置/系统应用
-        return isSettingsIntent(intent)
+        return viewBlockCandidateNow(cfg)
     }
 
-    private fun isSettingsIntent(intent: android.content.Intent): Boolean {
-        val action = intent.action.orEmpty()
-        if (action.startsWith("android.settings.")) return true
-        if (action.startsWith("miui.intent.action.")) return true
-        val pkg = intent.component?.packageName ?: intent.`package`.orEmpty()
-        return pkg in SETTINGS_PACKAGES
+    /**
+     * 「这轮是不是查看类」的**当下**判定:ASR 原文和 setQueryInfo 改写版一起看。
+     *
+     * 单看 [lastQueryText] 会被小爱的改写坑到(见 [lastAsrText] 的注释)。取并集,且:
+     *  - **放行词任一命中就放行** —— "打开系统更新"改写成"系统更新"后"打开"没了,
+     *    只看改写版会把用户明确要求的跳转拦下来。放行是安全侧。
+     *  - 查看词任一命中就算候选 —— 改写吃掉查看词时靠原文兜住。
+     */
+    private fun viewBlockCandidateNow(cfg: AiConfig): Boolean {
+        if (!cfg.blockViewJump) return false
+        val texts = currentQueryTexts()
+        if (texts.isEmpty()) return false
+        if (texts.any { hitsJumpAllowWord(it, cfg) }) return false
+        return texts.any { t -> VIEW_WORDS.any { t.contains(it) } }
+    }
+
+    /**
+     * 本轮所有可用的问话文本(改写版 + ASR 原文,去重)。
+     *
+     * ASR 原文带时效:它是上一次说话留下的,如果这轮压根没走语音(打字输入)就不该再算数,
+     * 否则会拿上一句的内容判定这一句。用和跳转拦截同样的 12 秒窗口。
+     */
+    /** 「这轮是不是发消息类」的当下判定。同样两个文本都看,理由见 [viewBlockCandidateNow]。 */
+    private fun sendMessageCommandNow(): Boolean =
+        currentQueryTexts().any { isSendMessageCommand(it) }
+
+    private fun currentQueryTexts(): List<String> {
+        val out = ArrayList<String>(2)
+        if (lastQueryText.isNotBlank()) out.add(lastQueryText)
+        if (lastAsrText.isNotBlank() && lastAsrText != lastQueryText &&
+            System.currentTimeMillis() - lastAsrTime <= 12_000L
+        ) out.add(lastAsrText)
+        return out
     }
 
     // 小爱答不上来的兜底:拦截 m2.startActivitySafely(Intent, String)。
@@ -702,7 +744,7 @@ class HookEntry : IXposedHookLoadPackage {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
                             val intent = param.args[1] as? android.content.Intent ?: return
-                            if (!shouldBlockJump(intent)) return
+                            if (!ownsCurrentTurn()) return
                             Log.i(TAG, "block intent launch: query=\"$lastQueryText\" intent=$intent")
                             param.result = when (m.returnType) {
                                 java.lang.Boolean.TYPE -> true
@@ -1020,6 +1062,12 @@ class HookEntry : IXposedHookLoadPackage {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val card = param.thisObject
+                            // 还没被认领、但这轮确实归我们 → 就地认领。
+                            // 有些话术卡不经过 jb0.vd(微信双开那句就是),只能在这兜底,
+                            // 否则语音被静音泵按住了、文字却照样显示出来。
+                            if (ourCardTexts[System.identityHashCode(card)] == null) {
+                                claimToastCard(card, "", via = "bindView", onlyIfUnclaimed = true)
+                            }
                             val text = ourCardTexts[System.identityHashCode(card)]
                             // 排查用(2026-07-20):无差别记一笔谁被 bind 了。
                             // 只在"是我们的卡"时才做事,于是"没有任何 toast 卡被 bind"
@@ -1038,6 +1086,61 @@ class HookEntry : IXposedHookLoadPackage {
                 Log.i(TAG, "hook FlowTemplateToastCard.bindView fail: $t")
             }
         }
+    }
+
+    /**
+     * 认领一张 toast 卡:归到我们当前服务的 dialogId 名下,并把它的文字换成我们的答案(或占位)。
+     *
+     * 抽出来是因为有**两个**入口:
+     *  - `jb0.vd.g0/i0` —— 通用话术卡的产地,查看类走这条。
+     *  - `FlowTemplateToastCard.bindView` —— 兜底。实测微信双开那句
+     *    ("暂不支持微信双开功能")由 ControlWxAudioSdkOperation 产出,压根不经过 vd,
+     *    于是卡片从没被认领,语音虽然被静音泵按住了,**文字还是原样留在屏幕上**。
+     *    与其再去挂一个 Operation 类(混淆名每版都变,而且下次换个话术又是新的类),
+     *    不如挂在所有 toast 卡都必经的渲染入口上。
+     *
+     * @param onlyIfUnclaimed 兜底入口用:这轮已经有认领好的卡就别抢,避免把正主顶掉。
+     */
+    private fun claimToastCard(
+        card: Any,
+        opDialogId: String,
+        via: String,
+        onlyIfUnclaimed: Boolean = false
+    ): Boolean {
+        // 注意:这类固定话术 Operation 的 dialogId 是合成字面量
+        // ("fakeDialogId"/"fakeErrorDialogId"),**不是**真实对话 id,匹配不上很正常。
+        // 用"静音泵是否在为当前交互运行"来判定这轮是否归我们。
+        val ours = opDialogId in pendingViewAnswer || opDialogId in takeOver
+        if (!ours && !isMutePumpActive()) return false
+
+        val did = mutePumpDialogId.ifBlank { lastDialogId }
+        if (did.isBlank()) return false
+
+        val hash = System.identityHashCode(card)
+        if (hash in commandeeredCards) return true          // already ours
+        if (onlyIfUnclaimed && answerCards[did]?.get() != null) return false
+
+        // 一轮里 vd 那个 hook 会命中**两个**对象:先是 card.e(没有 updateCardText),
+        // 再是 FlowTemplateToastCard(有)。后登记的覆盖先登记的,所以实测一直是能更新的
+        // 那张赢 —— 但那是顺序运气。顺序一旦反过来,我们就攥着一张改不了字的卡,
+        // 答案永远不上屏,现象就是"这轮没有卡片"。只认真正能改字的。
+        val updater = try {
+            card.javaClass.getMethod("updateCardText", String::class.java)
+        } catch (t: Throwable) {
+            Log.i(TAG, "skip non-updatable card@$hash class=${card.javaClass.name}")
+            return false
+        }
+        val text = aiAnswers[did] ?: THINKING_PLACEHOLDER
+        answerCards[did] = WeakReference(card)
+        ourCardTexts[hash] = text
+        try {
+            updater.invoke(card, text)
+        } catch (t: Throwable) {
+            Log.i(TAG, "commandeer: updateCardText failed: $t")
+        }
+        commandeeredCards.add(hash)
+        Log.i(TAG, "commandeered toast card@$hash via=$via opDialogId=$opDialogId -> dialogId=$did")
+        return true
     }
 
     /**
@@ -1272,8 +1375,10 @@ class HookEntry : IXposedHookLoadPackage {
                         Log.i(TAG, "skip takeover (whitelist pattern matched): $queryText")
                         return
                     }
-                    // 是"查看类"候选 → 预标记,以便它的 FlowTemplateToastCard 一 bindView 就被我们占位撑开
-                    if (isViewBlockCandidate(queryText, config)) {
+                    // 是"查看类"候选 → 预标记,以便它的 FlowTemplateToastCard 一 bindView 就被我们占位撑开。
+                    // 用 ...Now() 而不是 isViewBlockCandidate(queryText):此刻 lastQueryText 已经是
+                    // 改写版,而 ASR 原文还在 lastAsrText 里,两个都要看(见 lastAsrText 注释)。
+                    if (viewBlockCandidateNow(config)) {
                         pendingViewAnswer.add(dialogId)
                         // 这里**不**预先自建占位卡。优先接管小爱自己那张话术卡
                         // (hookToastCard):它的容器和显示时机都是对的,自建的插进去不上屏。
@@ -1286,7 +1391,7 @@ class HookEntry : IXposedHookLoadPackage {
                     }
                     // 发消息类:小爱这轮注定失败(双开/仅语音),我们接管。
                     // 同样要起泵 —— 否则它那句"暂不支持微信双开功能"会照常念出来。
-                    if (isSendMessageCommand(queryText)) {
+                    if (sendMessageCommandNow()) {
                         pendingViewAnswer.add(dialogId)
                         if (config.speakAnswer) startMutePump(dialogId)
                         Log.i(TAG, "send-message command, taking over: $queryText")
@@ -1772,11 +1877,19 @@ class HookEntry : IXposedHookLoadPackage {
                     ours || isMutePumpActive()
                 }
                 Log.i(TAG, "AI answer ready key=$key: $answer")
-                utteranceAnswers[key] = answer
-                // 答成了才记进历史 —— 失败的轮次不该污染后面的上下文。
-                // 一次问话只走到这里一次(utteranceCalling 挡住了并发,答案命中
-                // utteranceAnswers 缓存的重复提问根本不会再调 startAiCall),所以不会重复记。
-                if (config.contextEnabled) ChatHistory.record(queryText, answer)
+                // 软失败([AiClient.FAILED_ANSWER])要当失败处理,不能缓存也不能记历史。
+                // 它是**正常返回**的字符串,不像硬失败会抛异常走下面的 catch,所以得显式认。
+                // 缓存了的后果见 FAILED_ANSWER 的注释:用户重问命中 15 秒缓存,重播失败、
+                // 不重试。记历史的后果是这句废话会跟着进后续几轮的上下文。
+                val failed = answer == AiClient.FAILED_ANSWER
+                if (failed) Log.w(TAG, "soft failure, not cached/recorded key=$key")
+                if (!failed) {
+                    utteranceAnswers[key] = answer
+                    // 答成了才记进历史 —— 失败的轮次不该污染后面的上下文。
+                    // 一次问话只走到这里一次(utteranceCalling 挡住了并发,答案命中
+                    // utteranceAnswers 缓存的重复提问根本不会再调 startAiCall),所以不会重复记。
+                    if (config.contextEnabled) ChatHistory.record(queryText, answer)
+                }
                 // 先把卡片/注入/历史都落好,再开口,让画面和声音基本同时到
                 for (id in utteranceDialogs[key].orEmpty()) {
                     applyAnswer(key, id, answer)

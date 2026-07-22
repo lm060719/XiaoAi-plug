@@ -64,6 +64,17 @@ object AiClient {
     private data class Call(val name: String, val args: JSONObject, val id: String?)
 
     /**
+     * 「这轮没答上来」的软失败答案。
+     *
+     * 硬失败([chat] 抛异常)调用方本来就会当失败处理,但这一种是**正常返回**的字符串,
+     * 光看返回值和真答案没有区别。调用方必须能认出它,否则会把失败当答案缓存/记历史 ——
+     * 真机事故:天气问话遇到一次端点抖动返回本串,被 15 秒窗口缓存住;用户觉得不对再问
+     * 一遍(同一句话 → 同一个 key),直接命中缓存原样重播,**连重试都没发生**,
+     * 一次偶发抖动看起来就成了稳定故障。
+     */
+    const val FAILED_ANSWER = "(模型返回了无法解析的工具调用，没有得到答案)"
+
+    /**
      * @param history 之前几轮的问答(由旧到新),拼在本轮提问前面当上下文。见 [ChatHistory]。
      * @param allowMutating 每次工具执行时求值:本轮是否确实由我们接管。
      *   false 时动作类工具(launch_app / set_setting / …)被拒绝执行。
@@ -165,7 +176,7 @@ object AiClient {
                 val clean = stripToolTags(content)
                 if (clean.isBlank()) {
                     Log.w(TAG, "empty answer after stripping tool markup, raw=${content.take(200)}")
-                    return "(模型返回了无法解析的工具调用，没有得到答案)"
+                    return FAILED_ANSWER
                 }
                 return clean
             }

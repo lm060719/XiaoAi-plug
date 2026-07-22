@@ -66,6 +66,15 @@ object Tools {
         val modelHint: String = "",
         val params: List<Param> = emptyList(),
         val mutating: Boolean = false,
+        /**
+         * 按**本次参数**判定算不算动作类;返回 null 之外的值时覆盖 [mutating]。
+         *
+         * 为 run_shell 而存在:它是唯一一个"同一个工具既可能只读也可能毁灭性"的工具
+         * (`getprop ro.build.version.release` vs `rm -rf /data`),一个静态布尔值表达不了。
+         * 早先它 mutating=false,于是完全绕开了下面那道闸 —— 真机日志:未接管的轮次里
+         * 模型用 run_shell 连着 `am start` 了三次,真的把 Activity 拉了起来。
+         */
+        val mutatingWhen: ((JSONObject) -> Boolean)? = null,
         val handler: (JSONObject, Context?) -> String
     )
 
@@ -210,7 +219,8 @@ object Tools {
     fun execute(name: String, args: JSONObject, ctx: Context?, allowMutating: Boolean = true): String {
         val spec = byName[name]
             ?: return "error: unknown tool \"$name\"; available: ${byName.keys.joinToString(",")}"
-        if (spec.mutating && !allowMutating) {
+        val mutating = spec.mutatingWhen?.invoke(args) ?: spec.mutating
+        if (mutating && !allowMutating) {
             Log.i(TAG, "blocked mutating tool $name (round not ours)")
             return "error: 本轮对话由小爱自己处理，未被本模块接管，动作类工具已禁用。" +
                     "请只作答，不要尝试执行任何会改变设备状态的操作。"
@@ -229,20 +239,117 @@ object Tools {
         name = "run_shell",
         description = "以 root 执行任意 shell 命令。",
         modelHint = "用于没有专用工具覆盖的操作（安装/卸载应用、查看进程详情、改文件权限等）。" +
-                "能用专用工具就用专用工具——那些已经把输出解析好了，run_shell 的原始输出往往很长且要多轮往返。",
+                "能用专用工具就用专用工具——那些已经把输出解析好了，run_shell 的原始输出往往很长且要多轮往返。" +
+                "注意：只读命令（getprop/cat/ls/dumpsys 等）任何时候都能执行；" +
+                "会改变设备状态的命令只在本模块确实接管本轮对话时才会执行。",
         params = listOf(Param("command", "string", "要执行的 shell 命令", required = true)),
+        mutatingWhen = { args ->
+            !isReadOnlyShell(args.optString("command", args.optString("cmd", "")).trim())
+        },
         handler = { args, _ ->
             val cmd = args.optString("command", args.optString("cmd", "")).trim()
             if (cmd.isEmpty()) "error: empty command" else sh(cmd)
         }
     )
 
+    /**
+     * 纯读命令的可执行文件名。**白名单而不是黑名单** —— 这是道安全闸,
+     * 认不出的一律当成会动手。黑名单漏一个就等于放行,白名单漏一个只是少个能力。
+     *
+     * 不含 `pm` / `settings` / `wm` / `ip` 这类读写混合的:它们要看子命令,单独判(见下)。
+     * 也不含 `am` —— 它就没有只读用法。
+     */
+    private val READ_ONLY_SHELL_BINS = setOf(
+        "getprop", "cat", "ls", "df", "du", "ps", "grep", "egrep", "head", "tail",
+        "wc", "stat", "uptime", "date", "id", "whoami", "free", "netstat",
+        "printenv", "env", "echo", "find", "md5sum", "sha1sum", "dumpsys",
+        "top", "basename", "dirname", "readlink", "file", "which", "awk", "sed", "cut", "sort", "uniq"
+    )
+
+    /**
+     * 这条 shell 命令是不是纯只读。判**假**即视为动作类,在未接管的轮次里会被拒绝执行。
+     *
+     * 三条都必须成立,少一条就当动作类:
+     *  1. 不含重定向(`>` 会写文件)、命令替换(`` ` ``/`$()` 里能藏任意东西,拆不干净)
+     *  2. 拆开后**每一段**都在白名单里 —— 只看第一个词是不够的:
+     *     `getprop ro.build.version.release && rm -rf /data` 第一段完全无害。
+     *     实测模型确实会用 `&&` 串命令(查版本那次串了四条 getprop)。
+     *  3. 读写混合的命令要看子命令(`settings get` 可以,`settings put` 不行)
+     */
+    // internal 而不是 private:要给 src/test 下的 ShellGateTest 直接测。
+    // 这段是"模型能不能以 root 执行任意命令"的闸,推演过一次就漏了引号的情况
+    // (`grep -E 'level|status'` 里的 | 被当成管道),所以必须真跑测试。
+    internal fun isReadOnlyShell(cmd: String): Boolean {
+        if (cmd.isBlank()) return false
+        // 丢弃 stderr 是只读命令里的常见写法(`pm list packages 2>/dev/null`),
+        // 它不写任何文件。先摘掉这两种固定形式,再按"含 > 即写文件"判。
+        val stripped = cmd.replace("2>/dev/null", " ").replace("2>&1", " ")
+        val segments = splitShellSegments(stripped) ?: return false
+        if (segments.isEmpty()) return false
+        return segments.all { seg ->
+            val tokens = seg.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            val bin = tokens.firstOrNull()?.trim('\'', '"')?.substringAfterLast('/')
+                ?: return@all false
+            val sub = tokens.getOrNull(1)?.trim('\'', '"').orEmpty()
+            when {
+                bin in READ_ONLY_SHELL_BINS -> true
+                bin == "settings" -> sub == "get" || sub == "list"
+                bin == "pm" -> sub == "list" || sub == "path" || sub == "dump"
+                else -> false
+            }
+        }
+    }
+
+    /**
+     * 按 `; && || | &` 把命令拆成一段一段,**引号内的不算分隔符**。
+     * 遇到重定向 / 命令替换 / 引号没闭合,返回 null 表示"别放行"。
+     *
+     * 必须认引号:`dumpsys battery | grep -E 'level|status'` 里那个 `|` 是正则的一部分,
+     * 按字面切会得到 `grep -E 'level` 和 `status'` 两段,后者的"命令名"是 `status'`,
+     * 不在白名单里 → 整条被误判成动作类。这是只读命令里极常见的写法
+     * (device_status 自己就这么写),漏判会让模型在未接管的轮次里连查询都做不了。
+     *
+     * 单双引号要区别对待:`$(...)` 和反引号在**双引号内仍然会执行**,只有单引号才是字面量。
+     */
+    private fun splitShellSegments(cmd: String): List<String>? {
+        val segments = ArrayList<String>()
+        val cur = StringBuilder()
+        var quote = ' '
+        var i = 0
+        while (i < cmd.length) {
+            val c = cmd[i]
+            if (quote != ' ') {
+                // 双引号内命令替换照样生效,不能放行
+                if (quote == '"' && (c == '`' || (c == '$' && cmd.getOrNull(i + 1) == '('))) return null
+                if (c == quote) quote = ' '
+                cur.append(c); i++; continue
+            }
+            when {
+                c == '\'' || c == '"' -> { quote = c; cur.append(c); i++ }
+                c == '>' -> return null                                   // 写文件
+                c == '`' -> return null                                   // 命令替换
+                c == '$' && cmd.getOrNull(i + 1) == '(' -> return null    // 命令替换
+                c == ';' || c == '\n' -> { segments.add(cur.toString()); cur.clear(); i++ }
+                c == '&' || c == '|' -> {
+                    segments.add(cur.toString()); cur.clear()
+                    i += if (cmd.getOrNull(i + 1) == c) 2 else 1          // && / || 吃两个字符
+                }
+                else -> { cur.append(c); i++ }
+            }
+        }
+        if (quote != ' ') return null      // 引号没闭合,解析不可信
+        segments.add(cur.toString())
+        return segments.map { it.trim() }.filter { it.isNotEmpty() }
+    }
+
     // ---------------------------------------------------------------- 设备状态
 
     private val deviceStatus = Spec(
         name = "device_status",
         description = "一次性返回设备状态：电量与充电状态、剩余存储、内存、运行时长、机型、系统版本。",
-        modelHint = "用户问「还有多少电」「内存够不够」「手机是什么型号」时用。",
+        modelHint = "用户问「还有多少电」「内存够不够」「手机是什么型号」" +
+                "「安卓/系统版本是多少」「安全补丁到哪天」时用。" +
+                "版本类问题必须用它,别用 run_shell 拼 getprop——那样拿到的是没有标签的裸值,容易对错行。",
         handler = { _, _ ->
             // 一次 su 调用跑完所有采集。分五次起进程要多花近半秒。
             val raw = sh(
@@ -253,8 +360,19 @@ object Tools {
                 "echo '--STORAGE--'; df -h | grep -E ' /data$';" +
                 "echo '--MEM--'; cat /proc/meminfo | grep -E 'MemTotal|MemAvailable';" +
                 "echo '--UPTIME--'; uptime;" +
-                "echo '--MODEL--'; getprop ro.product.marketname; getprop ro.product.model;" +
-                "getprop ro.build.version.release; getprop ro.miui.ui.version.name"
+                // 每个值都**带标签**输出,不能只 getprop 出一串裸值。
+                // 真机事故:"查看系统版本"这轮 getprop 返回的四行是
+                //   BP2A.250605.031.A3 / 16 / 2026-06-01 / Xiaomi/xuanyuan:16/...
+                // 全无标签,要靠位置对号。模型没对上,改从 build 号 BP2A.**250605** 里
+                // 反推出"安全补丁 2025年6月5日"(实际 2026-06-01),Android 版本则直接
+                // 用先验知识写成 15(实际 16)。数据是对的,是递过去的形式让它没法信。
+                // marketname 尤其坑——"Xiaomi 15 Ultra"里那个 15 就挨着真版本号。
+                "echo '--MODEL--';" +
+                "echo -n 'marketname='; getprop ro.product.marketname;" +
+                "echo -n 'model='; getprop ro.product.model;" +
+                "echo -n 'android_version='; getprop ro.build.version.release;" +
+                "echo -n 'security_patch='; getprop ro.build.version.security_patch;" +
+                "echo -n 'hyperos_version='; getprop ro.miui.ui.version.name"
             )
             raw
         }

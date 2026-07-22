@@ -16,7 +16,7 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 2
-        versionName = "1.0.1"
+        versionName = "1.0.1.9"
     }
 
     buildTypes {
@@ -63,4 +63,9 @@ dependencies {
     implementation(libs.miuix.preference)
     implementation(libs.miuix.icons)
     implementation(libs.miuix.blur)
+
+    // 纯 JVM 单元测试(src/test)。只有不碰 Android framework 的纯逻辑走这里 ——
+    // 目前是 Tools.isReadOnlyShell:它决定模型能不能以 root 执行任意命令,
+    // 是全项目最不该被悄悄改坏的一段,必须有回归保护。
+    testImplementation(libs.junit)
 }
