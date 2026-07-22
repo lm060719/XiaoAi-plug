@@ -59,14 +59,16 @@ fun HomeScreen(
                     title = "无障碍服务",
                     summary = if (status.accessibilityOn) "已开启"
                     else "未开启。send_message 工具需要它",
+                    // 先让 vm 自己修(root / WRITE_SECURE_SETTINGS),修不动才跳设置页。
                     action = if (status.accessibilityOn) null else ({
-                        runCatching {
-                            context.startActivity(
-                                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            )
+                        vm.repairAccessibility {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
                         }
-                        Unit
                     })
                 )
                 if (!reachable) {

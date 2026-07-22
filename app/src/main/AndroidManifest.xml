@@ -1,9 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 平时 AiClient 是在小爱进程里跑的,借的是宿主的权限;只有配置页的「测试连接」
          在本进程发请求 —— 少了这条它就一直连不上,而正常对话看起来完全正常。 -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 无障碍服务被 MIUI 安全中心摘掉后自己写回来,见 AccessibilityGuard。
+         签名级权限,装完要手动授一次(之后永久有效,重装才丢):
+             adb shell pm grant io.mo.xiaoaiplug android.permission.WRITE_SECURE_SETTINGS
+         不授也能跑 —— AccessibilityGuard 会降级到 su,只是每次多花几百毫秒。
+         tools:ignore 是必须的:普通应用声明签名级权限,lint 默认当错误拦下来。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:label="@string/app_name"

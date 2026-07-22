@@ -104,6 +104,7 @@ class ConfigRepository private constructor(context: Context) {
         useNativeTools = true,
         contextEnabled = true,
         skipTakeoverEnabled = true,
-        skipTakeoverPattern = DEFAULT_SKIP_TAKEOVER_PATTERN
+        skipTakeoverPattern = DEFAULT_SKIP_TAKEOVER_PATTERN,
+        autoFixAccessibility = false
     )
 }

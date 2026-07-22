@@ -35,7 +35,10 @@ data class AiConfig(
     val skipTakeoverEnabled: Boolean = true,
     // 正则表达式,命中即跳过接管。留空即使开关开着也不生效(避免空正则误判成"全部匹配"),
     // 且留空时按"用默认"处理,见 [DEFAULT_SKIP_TAKEOVER_PATTERN]。
-    val skipTakeoverPattern: String = DEFAULT_SKIP_TAKEOVER_PATTERN
+    val skipTakeoverPattern: String = DEFAULT_SKIP_TAKEOVER_PATTERN,
+    // 无障碍被 MIUI 清后台摘掉后自动写回。见 AccessibilityGuard。
+    // **默认关**:它要动系统设置、要 root,不该在用户没点头之前就自己开着。
+    val autoFixAccessibility: Boolean = false
 ) {
     /** 当前服务商。旧存档(provider 为空)落到 [AiProvider.DEFAULT]。 */
     val aiProvider: AiProvider get() = AiProvider.fromKey(provider)
@@ -109,6 +112,7 @@ object ConfigClient {
         val nativeToolsRaw = result?.getString(ConfigKeys.USE_NATIVE_TOOLS)
         val contextRaw = result?.getString(ConfigKeys.CONTEXT_ENABLED)
         val skipTakeoverRaw = result?.getString(ConfigKeys.SKIP_TAKEOVER_ENABLED)
+        val autoFixRaw = result?.getString(ConfigKeys.AUTO_FIX_ACCESSIBILITY)
         return AiConfig(
             provider = result?.getString(ConfigKeys.PROVIDER).orEmpty(),
             endpoint = result?.getString(ConfigKeys.ENDPOINT).orEmpty(),
@@ -127,7 +131,9 @@ object ConfigClient {
             skipTakeoverEnabled = skipTakeoverRaw.isNullOrEmpty() || skipTakeoverRaw == "true",
             // 「从没配置过给默认值、用户手动清空就是空」的区分已经在 ConfigProvider 里做完了
             // (SharedPreferences.getString 的 defValue 只在 key 不存在时生效),这里不用再猜。
-            skipTakeoverPattern = result?.getString(ConfigKeys.SKIP_TAKEOVER_PATTERN).orEmpty()
+            skipTakeoverPattern = result?.getString(ConfigKeys.SKIP_TAKEOVER_PATTERN).orEmpty(),
+            // 注意这里不是「空即开」—— 默认关，只有显式存过 "true" 才算开。
+            autoFixAccessibility = autoFixRaw == "true"
         )
     }
 
@@ -150,6 +156,7 @@ object ConfigClient {
             putString(ConfigKeys.CONTEXT_ENABLED, config.contextEnabled.toString())
             putString(ConfigKeys.SKIP_TAKEOVER_ENABLED, config.skipTakeoverEnabled.toString())
             putString(ConfigKeys.SKIP_TAKEOVER_PATTERN, config.skipTakeoverPattern)
+            putString(ConfigKeys.AUTO_FIX_ACCESSIBILITY, config.autoFixAccessibility.toString())
         }
         return try {
             val out = context.contentResolver.call(uri, ConfigProvider.METHOD_SET, null, extras)

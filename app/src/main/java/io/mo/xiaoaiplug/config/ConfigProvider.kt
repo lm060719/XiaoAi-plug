@@ -7,6 +7,7 @@ import android.content.SharedPreferences
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import io.mo.xiaoaiplug.auto.AccessibilityGuard
 import io.mo.xiaoaiplug.auto.UiAutoService
 
 object ConfigKeys {
@@ -41,13 +42,17 @@ object ConfigKeys {
     const val SKIP_TAKEOVER_ENABLED = "skip_takeover_enabled"
     const val SKIP_TAKEOVER_PATTERN = "skip_takeover_pattern"
 
+    // 无障碍被 MIUI 摘掉后自动写回(见 AccessibilityGuard)。默认开。
+    const val AUTO_FIX_ACCESSIBILITY = "auto_fix_accessibility"
+
     val ALL = listOf(
         PROVIDER, ENDPOINT, API_KEY, MODEL, SYSTEM_PROMPT, ENABLED,
         BLOCK_VIEW_JUMP, JUMP_ALLOW_WORDS,
         BLOCK_WEB_SEARCH, WEB_SEARCH_ALLOW_WORDS,
         SPEAK_ANSWER,
         ENABLED_TOOLS, USE_NATIVE_TOOLS, CONTEXT_ENABLED,
-        SKIP_TAKEOVER_ENABLED, SKIP_TAKEOVER_PATTERN
+        SKIP_TAKEOVER_ENABLED, SKIP_TAKEOVER_PATTERN,
+        AUTO_FIX_ACCESSIBILITY
     )
 }
 
@@ -118,6 +123,18 @@ class ConfigProvider : ContentProvider() {
 
     override fun onCreate(): Boolean = true
 
+    /**
+     * 自动恢复无障碍的开关。
+     *
+     * 直接读自己的 SharedPreferences,不走 [ConfigClient] —— 那条路会绕一圈
+     * ContentResolver 再回到本 provider,而我们**已经在** provider 里了。
+     *
+     * **默认关**,和这里其它「空即开」的字段不是一个规矩:它要动系统设置、要 root,
+     * 得等用户在设置页明确打开(那时会先验一次 root)才生效。
+     */
+    private fun autoFixEnabled(): Boolean =
+        prefs().getString(ConfigKeys.AUTO_FIX_ACCESSIBILITY, "") == "true"
+
     /** 调用方是否有权调用 [method]。callingPackage 由系统填,伪造不了。 */
     private fun isCallerAllowed(method: String): Boolean {
         val caller = callingPackage ?: return false
@@ -154,15 +171,16 @@ class ConfigProvider : ContentProvider() {
                 Bundle().apply { putBoolean("ok", true) }
             }
             METHOD_UI_DUMP -> {
-                val svc = UiAutoService.instance
+                // 先自愈。MIUI 清后台会把无障碍权限摘掉,详见 AccessibilityGuard ——
+                // 不补这一下,用户每清一次后台就得手动去设置页开一次。
+                val failure = AccessibilityGuard.ensureRunning(context!!, autoFixEnabled())
                 Bundle().apply {
-                    putString(
-                        "result",
-                        svc?.dumpTree() ?: "error: 无障碍服务未运行(去系统设置里开启，或用 root 命令启用)"
-                    )
+                    putString("result", failure ?: UiAutoService.instance?.dumpTree()
+                        ?: "error: 无障碍服务刚连上又断了")
                 }
             }
             METHOD_SEND_MESSAGE -> {
+                val failure = AccessibilityGuard.ensureRunning(context!!, autoFixEnabled())
                 val svc = UiAutoService.instance
                 val contact = extras?.getString("contact").orEmpty()
                 val text = extras?.getString("text").orEmpty()
@@ -172,7 +190,8 @@ class ConfigProvider : ContentProvider() {
                     putString(
                         "result",
                         when {
-                            svc == null -> "error: 无障碍服务未运行"
+                            failure != null -> failure
+                            svc == null -> "error: 无障碍服务刚连上又断了"
                             contact.isBlank() || text.isBlank() -> "error: 联系人或内容为空"
                             else -> try {
                                 svc.sendWeChat(contact, text, send)
